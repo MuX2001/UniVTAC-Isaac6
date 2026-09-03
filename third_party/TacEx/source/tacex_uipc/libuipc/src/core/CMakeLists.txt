@@ -5,6 +5,7 @@ find_package(fmt CONFIG REQUIRED)
 
 find_package(cppitertools CONFIG REQUIRED)
 find_package(magic_enum CONFIG REQUIRED)
+find_package(dylib CONFIG REQUIRED)
 find_path(DYLIB_INCLUDE_DIRS "dylib.hpp")
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 find_package(cpptrace CONFIG REQUIRED)
@@ -49,6 +50,7 @@ target_link_libraries(uipc_core PUBLIC
     fmt::fmt
     cppitertools::cppitertools
     magic_enum::magic_enum
+    dylib::dylib
     cpptrace::cpptrace
 )
 
@@ -85,7 +87,6 @@ uipc_target_set_output_directory(uipc_core)
 # ------------------------------------------------------------------------------
 file(GLOB_RECURSE SOURCE_GROUP_FILES "*.h" "*.cpp" "*.inl")
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/.." FILES ${SOURCE_GROUP_FILES})
-
 
 
 

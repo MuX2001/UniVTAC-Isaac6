@@ -1,9 +1,37 @@
 import json
 import argparse
 import os
+import subprocess
 
-VCPKG_BASE_LINE = 'b2cb0da531c2f1f740045bfe7c4dac59f0b2b69c'
-VCPKG_TAG = '2024.11.16' 
+LEGACY_VCPKG_BASELINE = 'b2cb0da531c2f1f740045bfe7c4dac59f0b2b69c'
+
+
+def resolve_vcpkg_baseline() -> tuple[str, str]:
+    """Use the checked-out vcpkg revision unless an explicit pin is requested.
+
+    GitHub source archives can be regenerated after an old vcpkg baseline was
+    published.  Resolving to the local vcpkg HEAD retains vcpkg's checksum
+    verification while allowing current ports to carry corrected hashes.
+    """
+    explicit_baseline = os.environ.get("UIPC_VCPKG_BASELINE")
+    if explicit_baseline:
+        return explicit_baseline, "UIPC_VCPKG_BASELINE"
+
+    vcpkg_root = os.environ.get("VCPKG_ROOT")
+    if vcpkg_root:
+        result = subprocess.run(
+            ["git", "-C", vcpkg_root, "rev-parse", "HEAD"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip(), "VCPKG_ROOT HEAD"
+
+    return LEGACY_VCPKG_BASELINE, "legacy 2024.11.16 fallback"
+
+
+VCPKG_BASE_LINE, VCPKG_BASELINE_SOURCE = resolve_vcpkg_baseline()
 
 base_vcpkg_json = {
     'name': 'libuipc',
@@ -129,7 +157,7 @@ if __name__ == '__main__':
     print(f'[libuipc] Generating vcpkg.json with args:')
     for K,V in vars(args).items():
         print(f'    * {K}: {V}')
-    print('[libuipc] Vcpkg Tag:', VCPKG_TAG)
+    print('[libuipc] Vcpkg baseline:', VCPKG_BASE_LINE, f'({VCPKG_BASELINE_SOURCE})')
     
     json_path = f'{args.output_dir}/vcpkg.json'
     
@@ -168,5 +196,4 @@ if __name__ == '__main__':
           'If you want to skip, please define `-DUIPC_DEV_MODE=ON` when configuring CMake.')
     print_deps()
     exit(1)
-    
     

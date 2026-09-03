@@ -39,12 +39,13 @@ class TactileCfg:
     gelpad_cfg: UipcObjectCfg = None
     gelpad_attachment_cfg: UipcIsaacAttachmentsCfg = None
 
+# 触觉相机分辨率短边需 >= 300，否则 RTX 报 "below minimal input resolution of 300" 并模糊
 def create_gelsight_mini_cfg(
     prim_path: str,
     gelpad_prim_path: str,
     gelpad_attachment_body_name: str,
     name: str = "tactile_sensor",
-    resolution = (320, 240),
+    resolution = (400, 300),
     update_period = 1/120,
     data_type:list[str] = ["camera_depth", "tactile_rgb"],
 ):
@@ -165,7 +166,7 @@ def create_xensews_cfg(
     gelpad_attachment_body_name: str,
     gelpad_attachment_prim_path: str = None,
     name: str = "tactile_sensor",
-    resolution = (320, 240),
+    resolution = (400, 300),
     update_period = 1/120,
     data_type:list[str] = ["camera_depth", "tactile_rgb"],
 ) -> TactileCfg:

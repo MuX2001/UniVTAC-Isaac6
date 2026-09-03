@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from isaaclab.app import AppLauncher
+from eval_result_utils import build_run_id, load_worker_metadata, summarize_worker_metadata, worker_name, write_json
 # add argparse arguments
 parser = argparse.ArgumentParser(
     description="Eval Policy"
@@ -54,6 +55,12 @@ parser.add_argument(
     default=100
 )
 parser.add_argument(
+    "--max_steps",
+    type=int,
+    default=1e9,
+    help="Max simulation steps (env.step_count) per episode; use 0 关闭此限制，默认 200 步。"
+)
+parser.add_argument(
     "--print_only",
     action='store_true',
 )
@@ -86,13 +93,46 @@ def log(msg):
             f.write(msg + '\n')
     print(msg)
 
+
+def write_run_summary(
+    run_root: Path,
+    *,
+    policy_name: str,
+    task_name: str,
+    run_id: str,
+    deploy_config: dict,
+    task_config_file: Path,
+    deploy_config_file: Path,
+) -> dict:
+    worker_payloads = load_worker_metadata(run_root / "metadata")
+    summary = summarize_worker_metadata(worker_payloads)
+    summary.update({
+        "policy_name": policy_name,
+        "task_name": task_name,
+        "run_id": run_id,
+        "run_root": str(run_root),
+        "task_config_file": str(task_config_file),
+        "deploy_config_file": str(deploy_config_file),
+        "worker_metadata_files": [f"metadata/{name}.json" for name in sorted(worker_payloads)],
+        "deploy_config": deploy_config,
+    })
+    write_json(run_root / "metadata.json", summary)
+    return summary
+
 def eval_policy(
-    task: 'BaseTask', policy: 'BasePolicy', expert_check,
-    start_seed, max_seed, test_total_num, instructions, instruciton_type:Literal['seen', 'unseen']='seen'
+    task: 'BaseTask',
+    policy: 'BasePolicy',
+    expert_check,
+    start_seed,
+    max_seed,
+    test_total_num,
+    instructions,
+    instruciton_type:Literal['seen', 'unseen']='seen',
+    max_steps:int = 0,
 ):
     test_num, succ_num, seed = 0, 0, start_seed
 
-    seed_path = task.save_root.parent / 'seeds.json'
+    seed_path = task.save_root / 'metadata' / 'seeds.json'
     seed_path.parent.mkdir(parents=True, exist_ok=True)
     if seed_path.exists():
         with open(seed_path, 'r') as f:
@@ -101,11 +141,12 @@ def eval_policy(
         seed_status = {}
  
     while test_num < test_total_num and (max_seed == -1 or seed <= max_seed):
-        if not seed_status.get(str(seed), True):
+        seed_key = str(seed)
+        if not seed_status.get(seed_key, True):
             seed += 1
             continue
         
-        if expert_check and str(seed) not in seed_status:
+        if expert_check and seed_key not in seed_status:
             test_start = time.perf_counter()
             task.mode = 'eval_test'
             try:
@@ -114,7 +155,7 @@ def eval_policy(
                 if not task.check_success() or not task.plan_success:
                     raise ExecError(f'seed {seed} Expert check failed, check {task.check_success()}, plan {task.plan_success}.')
                 else:
-                    seed_status[seed] = True
+                    seed_status[seed_key] = True
                     with open(seed_path, 'w') as f:
                         json.dump(seed_status, f)
                 test_cost = time.perf_counter() - test_start
@@ -124,7 +165,7 @@ def eval_policy(
                 test_cost = time.perf_counter() - test_start
                 log(f'Expert check failed, seed {seed}, cost {test_cost:.2f}s, with exception {e}')
                 task.clean_cache(result='test_fail')
-                seed_status[seed] = False
+                seed_status[seed_key] = False
                 with open(seed_path, 'w') as f:
                     json.dump(seed_status, f)
                 seed += 1
@@ -139,6 +180,9 @@ def eval_policy(
             task.mean_steps = task.cfg.step_lim
             policy.reset()
             while task.take_action_cnt < task.cfg.step_lim:
+                # 限制仿真步数（step_count），防止 episode 过长
+                if max_steps is not None and max_steps > 0 and task.step_count >= max_steps:
+                    break
                 observation = task._get_observations()
                 policy.eval(task, observation)
                 if task.eval_success:
@@ -205,19 +249,25 @@ def main():
  
     deploy_config['instuction_file'] = deploy_config.get('instuction_file', task_file_name)
     if deploy_config['instuction_file'] is not None:
-        instructions, _ = get_config(
-            deploy_config['instuction_file'], default_root=Path(__file__).parent.parent / 'instructions', type='json'
-        )
+        try:
+            instructions, _ = get_config(
+                deploy_config['instuction_file'], default_root=Path(__file__).parent.parent / 'instructions', type='json'
+            )
+        except Exception as e:
+            log(f"Error loading instructions: {e}")
+            instructions = {'seen': ['Empty'], 'unseen': ['Empty']}
     else:
         instructions = {'seen': ['Empty'], 'unseen': ['Empty']}
 
     task_module = importlib.import_module(f"envs.{task_file_name}")
     policy_module = importlib.import_module(f"policy.{policy_name}")
-    
-    curr_time = time.strftime(r'%Y-%m-%d_%H:%M:%S')
+    run_id = build_run_id()
+    run_root = Path('eval_result') / policy_name / task_file_name / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
 
     env_cfg:BaseTaskCfg = task_module.TaskCfg()
-    env_cfg.save_dir = Path('eval_result') / policy_name / task_file_name / deploy_config_file.stem / curr_time
+    env_cfg.save_dir = run_root
+    env_cfg.worker_name = worker_name(0)
     env_cfg.decimation = task_config.get("decimation", env_cfg.decimation)
     env_cfg.obs_data_type = task_config.get("observations", {})
     env_cfg.save_frequency = task_config.get("save_frequency", env_cfg.save_frequency)
@@ -241,7 +291,7 @@ def main():
     if os.environ.get('TRAIN_CONFIG'):
         deploy_config['train_config'] = os.environ['TRAIN_CONFIG']
     
-    log_path = task.save_root / f"log.log"
+    log_path = run_root / "log.log"
     log(f"Task Name: {task_file_name}")
     log(f"Task Config: {task_config_file.absolute()}") 
     log(f"Eval Config: {json.dumps(deploy_config, ensure_ascii=False, indent=4)}\n{'-' * 20}\n") 
@@ -249,15 +299,29 @@ def main():
     log(f"Policy init finish in {policy_init_cost:.2f} seconds.")
 
     results = eval_policy(
-        task=task, policy=policy,
+        task=task,
+        policy=policy,
         expert_check=args_cli.expert_check,
         start_seed=1000000 * (1 + seed) if args_cli.start_seed == -1 else args_cli.start_seed,
         max_seed=args_cli.max_seed,
         test_total_num=args_cli.total_num,
         instructions=instructions,
-        instruciton_type=deploy_config.get("instruction_type", "seen")
+        instruciton_type=deploy_config.get("instruction_type", "seen"),
+        max_steps=args_cli.max_steps,
     )
-    log(f"Final Result: {results['succ_num']}/{results['test_num']}({results['succ_num']/results['test_num']*100:.2f}%) success.")
+    rate = (results['succ_num'] / results['test_num'] * 100) if results['test_num'] > 0 else 0.0
+    log(f"Final Result: {results['succ_num']}/{results['test_num']}({rate:.2f}%) success.")
+    summary = write_run_summary(
+        run_root,
+        policy_name=policy_name,
+        task_name=task_file_name,
+        run_id=run_id,
+        deploy_config=deploy_config,
+        task_config_file=task_config_file,
+        deploy_config_file=deploy_config_file,
+    )
+    log(f"Summary metadata: {run_root / 'metadata.json'}")
+    log(f"Summary stats: {summary['success']}/{summary['total_episodes']} ({summary['success_rate'] * 100:.2f}%)")
     
     task.close()
     policy.close()

@@ -10,7 +10,7 @@ class TaskCfg(BaseTaskCfg):
             offset=CameraCfg.OffsetCfg(pos=(1, 0.0, 0.15), rot=(0.5, 0.5, 0.5, 0.5), convention="opengl"),
             data_types=["rgb", "depth"],
             spawn=sim_utils.PinholeCameraCfg(
-                focal_length=2.5, focus_distance=1.0, horizontal_aperture=3.6, clipping_range=(0.1, 100.0)
+                focal_length=2.5, focus_distance=1.0, horizontal_aperture=3.6, clipping_range=(0.1, 100.0)  
             ),
             width=480,
             height=270,

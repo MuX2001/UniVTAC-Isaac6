@@ -1,7 +1,7 @@
 #include <uipc/diff_sim/adjoint_method_feature.h>
 #include <uipc/core/diff_sim.h>
 #include <Eigen/Core>
-#include <magic_enum.hpp>
+#include <magic_enum/magic_enum.hpp>
 #include <uipc/common/timer.h>
 #include <uipc/backend/buffer_view.h>
 #include <uipc/common/zip.h>

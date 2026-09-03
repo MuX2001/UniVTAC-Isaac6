@@ -18,6 +18,10 @@
 /dump
 **/__pycache__
 
+# Local failed TacEx/uipc builds: generated CMake and vcpkg output.
+/third_party/TacEx/source/tacex_uipc/build*/
+/third_party/TacEx/source/tacex_uipc/libuipc/build*/
+
 /.env_isaaclab
 .localrc.sh
 cvt.sh

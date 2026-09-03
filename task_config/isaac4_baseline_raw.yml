@@ -1,0 +1,27 @@
+# Isaac Sim 4.5 diagnostic baseline. This invokes each task's built-in
+# scripted controller via scripts/collect_data.py; no learned policy is loaded.
+# RGB is intentionally stored as raw uint8 arrays (not JPEG streams) so it can
+# be compared directly with the Isaac Sim 6 integration.
+save_dir: ./data/isaac4_baseline
+
+decimation: 1
+save_frequency: 2
+video_frequency: 2
+render_frequency: 0
+encode_images: false
+
+random_texture: false
+use_seed: true
+episode_num: 1
+start_seed: 0
+# A task may reject a seed due to scripted-planning or contact checks. The
+# collector advances deterministically until it obtains one successful episode.
+max_seed: 20
+
+sensor_type: gsmini
+
+observations:
+  camera: [rgb, depth]
+  tactile: [rgb, rgb_marker, marker, depth, pose]
+  embodiment: [joint, ee]
+  actor: true

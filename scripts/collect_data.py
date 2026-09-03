@@ -186,6 +186,7 @@ def main():
     env_cfg.save_frequency = task_config.get("save_frequency", env_cfg.save_frequency)
     env_cfg.video_frequency = task_config.get("video_frequency", env_cfg.video_frequency)
     env_cfg.render_frequency = task_config.get("render_frequency", env_cfg.render_frequency)
+    env_cfg.encode_images = task_config.get("encode_images", env_cfg.encode_images)
     env_cfg.obs_data_type = task_config.get("observations", {})
     env_cfg.random_texture = task_config.get("random_texture", False)
 

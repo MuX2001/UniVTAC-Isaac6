@@ -185,9 +185,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     global_rank = int(os.getenv("RANK", "0"))
     if args_cli.track and global_rank == 0:
-        if args_cli.wandb_entity is None:
+        try:
+            from openpi.shared.wandb_compat import USE_SWANLAB
+            from openpi.shared.wandb_compat import wandb
+        except Exception:
+            use_swanlab_env = os.environ.get("USE_SWANLAB", "true").strip().lower()
+            use_swanlab = use_swanlab_env in {"1", "true", "t", "yes", "y", "on"}
+            if use_swanlab:
+                try:
+                    import swanlab as wandb
+
+                    USE_SWANLAB = True
+                except Exception:
+                    import wandb
+
+                    USE_SWANLAB = False
+            else:
+                import wandb
+
+                USE_SWANLAB = False
+
+        if args_cli.wandb_entity is None and not USE_SWANLAB:
             raise ValueError("Weights and Biases entity must be specified for tracking.")
-        import wandb
 
         wandb.init(
             project=wandb_project,

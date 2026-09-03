@@ -10,6 +10,10 @@
 
 namespace uipc::core::internal
 {
+// vcpkg's current dylib port exposes the loader as dylib::library.  Keep the
+// legacy local spelling used throughout this file.
+using dylib = ::dylib::library;
+
 static string to_lower(std::string_view s)
 {
     string result{s};
@@ -43,9 +47,9 @@ class Engine::Impl
 
         // if not found, load it
         auto& uipc_config = uipc::config();
-        auto  backend =
-            uipc::make_shared<dylib>(uipc_config["module_dir"].get<std::string>(),
-                                     fmt::format("uipc_backend_{}", backend_name));
+        auto backend = uipc::make_shared<dylib>(
+            fmt::format("{}/uipc_backend_{}", uipc_config["module_dir"].get<std::string>(), backend_name),
+            ::dylib::decorations::os_default());
 
         auto info             = make_unique<UIPCModuleInitInfo>();
         info->module_name     = backend_name;

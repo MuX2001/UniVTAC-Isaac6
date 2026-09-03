@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import time
@@ -34,7 +35,7 @@ from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import FrameTransformer, FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
-from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.sim import PhysxCfg, RenderCfg, SimulationCfg
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
@@ -85,12 +86,14 @@ class BaseTaskCfg(DirectRLEnvCfg):
     step_lim = 300
 
     save_dir = "auto"
+    worker_name: str | None = None
     obs_data_type = {}
 
     save_frequency = 1
     video_frequency = 1
     render_frequency = 0
-    video_size = (960, 320)
+    encode_images: bool = True
+    video_size = (960, 320)  # (width, height); keep 320 to avoid upscaling low-res camera (would look blocky)
 
     ui_window_class_type = BaseEnvWindow
 
@@ -108,7 +111,14 @@ class BaseTaskCfg(DirectRLEnvCfg):
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
             restitution=0.0,
-        )
+        ),
+        # 避免 A800 headless 下 "Render resolution below minimal input resolution of 300" 导致的模糊：
+        # 用 FXAA 完全不走 DLSS/DLAA 管线，不会触发低分辨率放大；若仍模糊可再检查各任务是否覆盖相机为 480x270
+        render=RenderCfg(
+            rendering_mode="quality",
+            enable_dl_denoiser=True,
+            antialiasing_mode="FXAA",
+        ),
     )
 
     uipc_sim = UipcSimCfg(
@@ -160,6 +170,7 @@ class BaseTaskCfg(DirectRLEnvCfg):
     adaptive_grasp_depth_threshold = None # in mm
     reset_time_limit: float = 120.0  # in seconds
 
+    # 相机分辨率需满足 RTX/DLSS 最小输入（短边 >= 300），否则会报 "below minimal input resolution of 300" 且画面模糊
     cameras: list[CameraCfg] = [
         CameraCfg(
             name="head",
@@ -169,8 +180,8 @@ class BaseTaskCfg(DirectRLEnvCfg):
             spawn=sim_utils.PinholeCameraCfg(
                 focal_length=1.94, focus_distance=1.0, horizontal_aperture=2.688, clipping_range=(0.01, 100.0)
             ),
-            width=480,
-            height=270,
+            width=640,
+            height=360,
             update_period=1/120
         ),
         CameraCfg(
@@ -178,8 +189,8 @@ class BaseTaskCfg(DirectRLEnvCfg):
             prim_path="/World/envs/env_.*/Robot/WristCamera/Camera",
             data_types=["rgb", "depth"],
             spawn=None, # use existing camera
-            width=480,
-            height=270,
+            width=640,
+            height=360,
             update_period=1/120,
         )
     ]
@@ -208,6 +219,7 @@ class BaseTask(UipcRLEnv):
         cfg = self.load_robot_and_sensors(cfg)
         
         self.cfg = cfg
+        self.mode = mode
         self.render_outdated = True
 
         self._setup_save()
@@ -217,7 +229,6 @@ class BaseTask(UipcRLEnv):
         self.logger = logging.getLogger(name=self.__class__.__name__)
         self.logger.setLevel(getattr(logging, self.cfg.logger_level.upper(), logging.ERROR))
 
-        self.mode = mode
         self.first_frame = None
         
         self.start_time = 0.0
@@ -277,12 +288,21 @@ class BaseTask(UipcRLEnv):
 
         self.save_root = Path(save_dir)
         self.save_root.mkdir(parents=True, exist_ok=True)
-        self.tmp_save_dir = self.save_root / '.cache' / str(self.cfg.seed)
-        self.save_path = self.save_root / 'hdf5' / f'{self.cfg.seed}.hdf5'
-        self.save_video_path = self.save_root / 'video' / f'{self.cfg.seed}.mp4'
-        self.metadata_path = self.save_root / 'metadata.json'
 
-        self.cfg.uipc_sim.workspace = str(self.save_root / 'scene')
+        if self.mode == 'eval':
+            self.worker_name = self.cfg.worker_name or 'worker_0'
+            self.tmp_save_dir = self.save_root / '.cache' / self.worker_name / str(self.cfg.seed)
+            self.save_path = self.save_root / 'hdf5' / self.worker_name / f'{self.cfg.seed}.hdf5'
+            self.save_video_path = self.save_root / 'video' / self.worker_name / f'{self.cfg.seed}.mp4'
+            self.metadata_path = self.save_root / 'metadata' / f'{self.worker_name}.json'
+            self.cfg.uipc_sim.workspace = str(self.save_root / 'scene' / self.worker_name)
+        else:
+            self.worker_name = None
+            self.tmp_save_dir = self.save_root / '.cache' / str(self.cfg.seed)
+            self.save_path = self.save_root / 'hdf5' / f'{self.cfg.seed}.hdf5'
+            self.save_video_path = self.save_root / 'video' / f'{self.cfg.seed}.mp4'
+            self.metadata_path = self.save_root / 'metadata.json'
+            self.cfg.uipc_sim.workspace = str(self.save_root / 'scene')
 
     def _setup_scene(self):
         '''
@@ -386,9 +406,9 @@ class BaseTask(UipcRLEnv):
             for _ in range(5):
                 self._step(is_save=False)
                 reset_test_cost = time.perf_counter() - reset_test_start
-                if reset_test_cost > self.cfg.reset_time_limit:
+                if reset_test_cost > 8 * self.cfg.reset_time_limit:
                     raise RuntimeError(
-                        f'Timeout: reset exceed time limit of {self.cfg.reset_time_limit} s, cost {reset_test_cost} s.'
+                        f'Timeout: reset exceed time limit of {8 * self.cfg.reset_time_limit} s, cost {reset_test_cost} s.'
                     )
             self._update_render()
 
@@ -402,9 +422,9 @@ class BaseTask(UipcRLEnv):
             for _ in range(20):
                 self._step(is_save=False)
                 reset_test_cost = time.perf_counter() - reset_test_start
-                if reset_test_cost > self.cfg.reset_time_limit:
+                if reset_test_cost > self.cfg.reset_time_limit * 8:
                     raise RuntimeError(
-                        f'Timeout: reset exceed time limit of {self.cfg.reset_time_limit} s, cost {reset_test_cost} s.'
+                        f'Timeout: reset exceed time limit of {self.cfg.reset_time_limit * 8} s, cost {reset_test_cost} s.'
                     )
             self._update_render()
             self._actor_manager.remove_animate()
@@ -479,19 +499,22 @@ class BaseTask(UipcRLEnv):
     def get_frame_shot(self, obs):
         head_obs = obs['observation']['head']['rgb'].clone()
         wrist_obs = obs['observation']['wrist']['rgb'].clone()
-        tac_size = 160
-        left_tac = torchvision.transforms.Resize((tac_size, tac_size))(
+        # Match video_size (960, 320): do not upscale (sim camera may be 224/320; upscale → blocky video)
+        tac_w, tac_h = 160, 320  # tactile on sides
+        img_h, cam_w = 320, 320  # center: head and wrist each 320
+        left_tac = torchvision.transforms.Resize((tac_h, tac_w))(
             obs['tactile']['left_tactile']['rgb_marker'].clone().permute(2, 0, 1)).permute(1, 2, 0)
-        right_tac = torchvision.transforms.Resize((tac_size, tac_size))(
+        right_tac = torchvision.transforms.Resize((tac_h, tac_w))(
             obs['tactile']['right_tactile']['rgb_marker'].clone().permute(2, 0, 1)).permute(1, 2, 0)
+        head_img = torchvision.transforms.Resize((img_h, cam_w))(head_obs.permute(2, 0, 1)).permute(1, 2, 0)
+        wrist_img = torchvision.transforms.Resize((img_h, cam_w))(wrist_obs.permute(2, 0, 1)).permute(1, 2, 0)
 
-        img = torch.zeros((320, 480*2+160, 3), dtype=head_obs.dtype)
-        img[:, :480, :] = torchvision.transforms.Resize(
-            (320, 480))(head_obs.permute(2, 0, 1)).permute(1, 2, 0)
-        img[:, 480:480*2, :] = torchvision.transforms.Resize(
-            (320, 480))(wrist_obs.permute(2, 0, 1)).permute(1, 2, 0)
-        img[:tac_size, 480*2:, :] = left_tac
-        img[tac_size:, 480*2:, :] = right_tac
+        # Layout: [left_tac | head | wrist | right_tac], tactile on sides so camera view is unobstructed
+        img = torch.zeros((img_h, tac_w + cam_w * 2 + tac_w, 3), dtype=head_obs.dtype)
+        img[:, :tac_w] = left_tac
+        img[:, tac_w : tac_w + cam_w] = head_img
+        img[:, tac_w + cam_w : tac_w + cam_w * 2] = wrist_img
+        img[:, -tac_w:] = right_tac
         return img
 
     @staticmethod
@@ -596,7 +619,7 @@ class BaseTask(UipcRLEnv):
             'total_cost': total_cost
         }
         self.log = self._step_callback(status_dict)
-        print(self.log+' '*5, end='\r')
+        print(self.log, flush=True)
     
     def _play_once(self):
         pass
@@ -646,9 +669,14 @@ class BaseTask(UipcRLEnv):
  
     def save_to_hdf5(self):
         self.save_path.parent.mkdir(parents=True, exist_ok=True)
-        HDF5Handler().pkls_to_hdf5(self.tmp_save_dir, self.save_path)
+        HDF5Handler().pkls_to_hdf5(
+            self.tmp_save_dir,
+            self.save_path,
+            encode_images=self.cfg.encode_images,
+        )
     
     def _save_metadata(self):
+        self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
         if self.metadata_path.exists():
             try:
                 with open(self.metadata_path, 'r', encoding='utf-8') as f:
@@ -658,8 +686,16 @@ class BaseTask(UipcRLEnv):
         else:
             all_metadata = {}
         all_metadata[str(self.cfg.seed)] = self.metadata
-        with open(self.metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(all_metadata, f, ensure_ascii=False, indent=4)
+        tmp_path = self.metadata_path.with_name(
+            f"{self.metadata_path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+        )
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(all_metadata, f, ensure_ascii=False, indent=4)
+            os.replace(tmp_path, self.metadata_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
     def save_observations(self, obs: dict):
         def to_cpu(data):

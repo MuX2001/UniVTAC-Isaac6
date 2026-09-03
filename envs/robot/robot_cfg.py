@@ -1,6 +1,10 @@
 from tacex_assets.robots.franka.franka_gsmini_gripper_uipc_high_res import (
     FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_HIGH_RES_UIPC_CFG
 )
+from tacex_assets.robots.franka.franka_gsmini_gripper_uipc import (
+    FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_UIPC_CFG
+)
+import os
 from tacex_assets.robots.franka.franka_xensews_gripper_uipc import (
     FRANKA_PANDA_ARM_XENSEWS_GRIPPER_HIGH_PD_HIGH_RES_UIPC_CFG
 )
@@ -25,7 +29,10 @@ class RobotCfg:
     contact_threshold: tuple[float, float] = (27.5, 28.0) # in mm, used in `gravity_rotate` api
 
 def create_franka_gsmini_gripper(data_type:list[str]):
-    robot = FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_HIGH_RES_UIPC_CFG.replace(
+    robot_cfg = (FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_UIPC_CFG
+                 if os.getenv("UNIVTAC_USE_AVAILABLE_UIPC_ASSET")
+                 else FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_HIGH_RES_UIPC_CFG)
+    robot = robot_cfg.replace(
         prim_path="/World/envs/env_.*/Robot",
         init_state=ArticulationCfg.InitialStateCfg(
             joint_pos={
@@ -107,9 +114,9 @@ def create_franka_gf225_gripper(data_type:list[str]):
         tactiles=tactiles,
         gripper_offset=0.131,
         gripper_max_qpos=0.039,
-        tactile_far_plane=29.0,
-        adaptive_grasp_depth_threshold=26.8,
-        contact_threshold=(26.5, 27.0)
+        tactile_far_plane=26.5,
+        adaptive_grasp_depth_threshold=25.3,
+        contact_threshold=(25.5, 26.3)
     )
 
 def create_franka_xensews_gripper(data_type:list[str]):
@@ -149,9 +156,9 @@ def create_franka_xensews_gripper(data_type:list[str]):
     return RobotCfg(
         robot=robot,
         tactiles=tactiles,
-        gripper_offset=0.125,
+        gripper_offset=0.131,
         gripper_max_qpos=0.039,
         tactile_far_plane=30.0,
-        adaptive_grasp_depth_threshold=24.8,
-        contact_threshold=(24.5, 25.0)
+        adaptive_grasp_depth_threshold=27.3,
+        contact_threshold=(27.5, 27.8)
     )

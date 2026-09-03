@@ -15,21 +15,14 @@ from envs.utils.data import HDF5Handler
 def load_hdf5(dataset_paths, camera_type, downsample_factor):
     data_paths = [
         'embodiment/joint',
+        'tactile/left_tactile/rgb_marker',
+        'tactile/right_tactile/rgb_marker',
     ]
     if camera_type == 'all':
         data_paths.append(f'observation/head/rgb')
         data_paths.append(f'observation/wrist/rgb')
     else:
-        data_paths.append(f'observation/{camera_type}/rgb')    
-    
-    with h5py.File(str(dataset_paths[0]), 'r') as f:
-        try:
-            f['tactile/left_tactile/rgb_marker']
-            data_paths.append('tactile/left_tactile/rgb_marker')
-            data_paths.append('tactile/right_tactile/rgb_marker')
-        except:
-            data_paths.append('tactile/left_gsmini/rgb_marker')
-            data_paths.append('tactile/right_gsmini/rgb_marker')
+        data_paths.append(f'observation/{camera_type}/rgb')
 
     data = HDF5Handler().batch_gather_hdf5(
         dataset_paths,
@@ -45,10 +38,8 @@ def load_hdf5(dataset_paths, camera_type, downsample_factor):
 def data_transform(path, episode_num, save_path):
     hdf5_dir = Path(path) / 'hdf5'
     if not hdf5_dir.exists():
-        hdf5_dir = Path(path)
-        if len(list(hdf5_dir.glob('*.hdf5'))) == 0:
-            print(f"HDF5 directory does not exist at \n{hdf5_dir}\n")
-            raise FileNotFoundError(f"HDF5 directory not found: {hdf5_dir}")
+        print(f"HDF5 directory does not exist at \n{hdf5_dir}\n")
+        exit()
     
     # 获取所有 episode 文件
     hdf5_files = sorted(hdf5_dir.glob('*.hdf5'), key=lambda x: int(x.stem))

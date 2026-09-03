@@ -11,7 +11,8 @@ from tqdm import tqdm
 from queue import Empty
 from pathlib import Path
 from typing import Literal, TYPE_CHECKING
-from multiprocessing import Process, Queue, Manager, Event, current_process
+from multiprocessing import Process, Queue, Manager, Event
+from eval_result_utils import build_run_id, load_worker_metadata, summarize_worker_metadata, worker_name, write_json
 
 if TYPE_CHECKING:
     from envs._base_task import BaseTask, BaseTaskCfg
@@ -42,7 +43,37 @@ def split_devices(cuda_visible_devices: str, workers: int):
     return assignment
 
 
-def worker_run(args, deploy_config, task_config, task_file_name, policy_name,
+def write_run_summary(
+    run_root: Path,
+    *,
+    policy_name: str,
+    task_name: str,
+    run_id: str,
+    deploy_config: dict,
+    task_config_file: Path,
+    deploy_config_file: Path,
+    total_tests: int,
+    workers: int,
+) -> dict:
+    worker_payloads = load_worker_metadata(run_root / "metadata")
+    summary = summarize_worker_metadata(worker_payloads)
+    summary.update({
+        "policy_name": policy_name,
+        "task_name": task_name,
+        "run_id": run_id,
+        "run_root": str(run_root),
+        "task_config_file": str(task_config_file),
+        "deploy_config_file": str(deploy_config_file),
+        "total_tests_target": total_tests,
+        "workers_target": workers,
+        "worker_metadata_files": [f"metadata/{name}.json" for name in sorted(worker_payloads)],
+        "deploy_config": deploy_config,
+    })
+    write_json(run_root / "metadata.json", summary)
+    return summary
+
+
+def worker_run(worker_idx, args, deploy_config, task_config, task_file_name, policy_name,
                instructions, base_save_dir: Path, seed_q: Queue, progress, stop_event: Event,
                log_file: Path, device_list, status_dict, result_q: Queue):
     # Per-process env: set CUDA_VISIBLE_DEVICES
@@ -74,10 +105,9 @@ def worker_run(args, deploy_config, task_config, task_file_name, policy_name,
         policy_module = importlib.import_module(f"policy.{policy_name}")
 
         env_cfg:'BaseTaskCfg' = task_module.TaskCfg()
-        # Each worker gets its own save_dir under base + worker id
-        worker_id = current_process().name.split('-')[-1]  # e.g., Process-1 -> '1'
-        worker_save_dir = base_save_dir / worker_id
-        env_cfg.save_dir = worker_save_dir
+        worker_id = worker_name(worker_idx)
+        env_cfg.save_dir = base_save_dir
+        env_cfg.worker_name = worker_id
         env_cfg.decimation = task_config.get("decimation", env_cfg.decimation)
         env_cfg.obs_data_type = task_config.get("observations", {})
         env_cfg.save_frequency = task_config.get("save_frequency", env_cfg.save_frequency)
@@ -239,8 +269,8 @@ def main():
         instructions = {'seen': ['Empty'], 'unseen': ['Empty']}
 
     # Base save dir with unified date
-    curr_time = time.strftime(r'%Y-%m-%d_%H:%M:%S')
-    base_save_dir = Path('eval_result') / policy_name / args.task_name / deploy_config_file.stem / curr_time
+    run_id = build_run_id()
+    base_save_dir = Path('eval_result') / policy_name / args.task_name / run_id
     base_save_dir.mkdir(parents=True, exist_ok=True)
     out_log = base_save_dir / 'out.log'
     clean_log = base_save_dir / 'log.log'
@@ -300,8 +330,8 @@ def main():
         worker_status.append(status_proxy)
         p = Process(
             target=worker_run,
-            name=f"Worker-{w+1}",
-            args=(args, deploy_config, task_config, args.task_name, policy_name, instructions,
+            name=worker_name(w),
+            args=(w, args, deploy_config, task_config, args.task_name, policy_name, instructions,
                   base_save_dir, seed_q, progress, stop_event, out_log, assignments[w], status_proxy, result_q)
         )
         p.start()
@@ -328,7 +358,7 @@ def main():
                 except Empty:
                     break
                 else:
-                    prefix = f"Worker-{event['worker']} Seed {event['seed']}"
+                    prefix = f"{event['worker']} Seed {event['seed']}"
                     if event['result'] == 'success':
                         write_clean(f"{prefix} success in {event['cost']:.2f}s; steps {event['steps']}, actions {event['actions']}")
                     elif event['result'] == 'failed':
@@ -337,6 +367,7 @@ def main():
                         write_clean(f"{prefix} error; see out.log for traceback")
                     write_out(f"{prefix} result={event['result']} cost={event['cost']} steps={event['steps']} actions={event['actions']}")
 
+                    done = progress.get('done', 0)
                     if done < args.total_num:
                         # Feed more seeds; try to keep queue non-empty
                         # Put a few seeds per iteration to avoid starvation
@@ -370,7 +401,7 @@ def main():
                     f"[Task: {args.task_name} (Config: {task_config_file.stem})] [Policy: {policy_name} (Config: {train_config})] [Deploy Config {deploy_config_file.stem}]",
                     f"[Status] {done}/{args.total_num} done | succ {succ} | errors {errors} | success_rate {rate:.2f}%"
                 ]
-                for idx, st in enumerate(worker_status, start=1):
+                for idx, st in enumerate(worker_status):
                     seed_str = str(st.get('current_seed', '-')) if st.get('current_seed') is not None else '-'
                     cost_val = st.get('last_cost')
                     cost_str = f"{cost_val:.2f}" if cost_val is not None else '-'
@@ -378,7 +409,7 @@ def main():
                     action_str = str(st.get('actions', '-')) if st.get('actions') is not None else '-'
                     atom_str = str(st.get('atom', '-'))
                     status_lines.append(
-                        f"  Worker-{idx}: {st.get('state', 'init'):<7} seed={seed_str:<8} "
+                        f"  {worker_name(idx)}: {st.get('state', 'init'):<7} seed={seed_str:<8} "
                         f"last={st.get('last_result', '-'):<7} cost={cost_str:<7} steps={step_str:<6} actions={action_str:<6} atom={atom_str}"
                     )
                 block = '\n'.join(status_lines)
@@ -400,12 +431,26 @@ def main():
             p.join()
         print("\n[Status] All workers finished.")
         # Final summary
-        total = args.total_num
         done = progress.get('done', 0)
         succ = progress.get('succ', 0)
         errors = progress.get('errors', 0)
         rate = (succ / done * 100) if done > 0 else 0
-        final_msg = f"[Final] {succ}/{done} ({rate:.2f}%) success; errors {errors}; out_log={out_log}; clean_log={clean_log}"
+        summary = write_run_summary(
+            base_save_dir,
+            policy_name=policy_name,
+            task_name=args.task_name,
+            run_id=run_id,
+            deploy_config=deploy_config,
+            task_config_file=task_config_file,
+            deploy_config_file=deploy_config_file,
+            total_tests=args.total_num,
+            workers=args.workers,
+        )
+        final_msg = (
+            f"[Final] {succ}/{done} ({rate:.2f}%) success; errors {errors}; "
+            f"out_log={out_log}; clean_log={clean_log}; summary={base_save_dir / 'metadata.json'}; "
+            f"episodes={summary['total_episodes']}"
+        )
         print(final_msg)
         write_clean(final_msg)
         write_out(final_msg)
