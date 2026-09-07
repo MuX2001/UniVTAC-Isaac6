@@ -1,10 +1,6 @@
 from tacex_assets.robots.franka.franka_gsmini_gripper_uipc_high_res import (
     FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_HIGH_RES_UIPC_CFG
 )
-from tacex_assets.robots.franka.franka_gsmini_gripper_uipc import (
-    FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_UIPC_CFG
-)
-import os
 from tacex_assets.robots.franka.franka_xensews_gripper_uipc import (
     FRANKA_PANDA_ARM_XENSEWS_GRIPPER_HIGH_PD_HIGH_RES_UIPC_CFG
 )
@@ -29,10 +25,7 @@ class RobotCfg:
     contact_threshold: tuple[float, float] = (27.5, 28.0) # in mm, used in `gravity_rotate` api
 
 def create_franka_gsmini_gripper(data_type:list[str]):
-    robot_cfg = (FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_UIPC_CFG
-                 if os.getenv("UNIVTAC_USE_AVAILABLE_UIPC_ASSET")
-                 else FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_HIGH_RES_UIPC_CFG)
-    robot = robot_cfg.replace(
+    robot = FRANKA_PANDA_ARM_GSMINI_GRIPPER_HIGH_PD_HIGH_RES_UIPC_CFG.replace(
         prim_path="/World/envs/env_.*/Robot",
         init_state=ArticulationCfg.InitialStateCfg(
             joint_pos={

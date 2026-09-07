@@ -12,6 +12,8 @@
 /data/*
 !/data/download.sh
 /eval_result
+/eval_results
+/runtime-output
 /policy/**/data*/**
 /policy/**/outputs*/**
 /policy/**/checkpoints*/**

@@ -17,7 +17,6 @@ from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import Any
 
-import isaacsim.core.utils.torch as torch_utils
 import omni.kit.app
 import omni.log
 from isaacsim.core.simulation_manager import SimulationManager
@@ -31,6 +30,7 @@ from isaaclab.managers import EventManager
 # from isaaclab.scene import InteractiveScene
 from isaaclab.sim import SimulationContext
 from isaaclab.utils.noise import NoiseModel
+from isaaclab.utils.seed import configure_seed
 from isaaclab.utils.timer import Timer
 
 from tacex_uipc.sim import UipcSim
@@ -109,7 +109,7 @@ class UipcRLEnv(DirectRLEnv):
         # viewport is not available in other rendering modes so the function will throw a warning
         # FIXME: This needs to be fixed in the future when we unify the UI functionalities even for
         # non-rendering modes.
-        if self.sim.render_mode >= self.sim.RenderMode.PARTIAL_RENDERING:
+        if self.sim.has_gui:
             self.viewport_camera_controller = ViewportCameraController(self, self.cfg.viewer)
         else:
             self.viewport_camera_controller = None
@@ -147,7 +147,7 @@ class UipcRLEnv(DirectRLEnv):
         # extend UI elements
         # we need to do this here after all the managers are initialized
         # this is because they dictate the sensors and commands right now
-        if self.sim.has_gui() and self.cfg.ui_window_class_type is not None:
+        if self.sim.has_gui and self.cfg.ui_window_class_type is not None:
             self._window = self.cfg.ui_window_class_type(self, window_name="IsaacLab")
         else:
             # if no window, then we don't need to store the window
@@ -229,6 +229,11 @@ class UipcRLEnv(DirectRLEnv):
         return self.sim.device
 
     @property
+    def has_rtx_sensors(self) -> bool:
+        """Whether the current Isaac Lab scene has active RTX camera sensors."""
+        return bool(self.sim.get_setting("/isaaclab/render/rtx_sensors"))
+
+    @property
     def max_episode_length_s(self) -> float:
         """Maximum episode length in seconds."""
         return self.cfg.episode_length_s
@@ -272,10 +277,10 @@ class UipcRLEnv(DirectRLEnv):
         self.sim.forward()
 
         # if sensors are added to the scene, make sure we render to reflect changes in reset
-        if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
+        if self.has_rtx_sensors and self.cfg.rerender_on_reset:
             self.sim.render()
 
-        if self.cfg.wait_for_textures and self.sim.has_rtx_sensors():
+        if self.cfg.wait_for_textures and self.has_rtx_sensors:
             while SimulationManager.assets_loading():
                 self.sim.render()
 
@@ -316,7 +321,7 @@ class UipcRLEnv(DirectRLEnv):
 
         # check if we need to do rendering within the physics loop
         # note: checked here once to avoid multiple checks within the loop
-        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        is_rendering = self.sim.has_gui or self.has_rtx_sensors
 
         # perform physics stepping
         for _ in range(self.cfg.decimation):
@@ -360,7 +365,7 @@ class UipcRLEnv(DirectRLEnv):
             self.scene.write_data_to_sim()
             self.sim.forward()
             # if sensors are added to the scene, make sure we render to reflect changes in reset
-            if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
+            if self.has_rtx_sensors and self.cfg.rerender_on_reset:
                 if self.uipc_sim is not None:
                     self.uipc_sim.update_render_meshes()
                 self.sim.render()
@@ -399,7 +404,7 @@ class UipcRLEnv(DirectRLEnv):
         except ModuleNotFoundError:
             pass
         # set seed for torch and other libraries
-        return torch_utils.set_seed(seed)
+        return configure_seed(seed)
 
     def render(self, recompute: bool = False) -> np.ndarray | None:
         """Run rendering without stepping through the physics.
@@ -425,7 +430,7 @@ class UipcRLEnv(DirectRLEnv):
         """
         # run a rendering step of the simulator
         # if we have rtx sensors, we do not need to render again sin
-        if not self.sim.has_rtx_sensors() and not recompute:
+        if not self.has_rtx_sensors and not recompute:
             if self.uipc_sim is not None:
                 self.uipc_sim.update_render_meshes()
             self.sim.render()
@@ -434,12 +439,10 @@ class UipcRLEnv(DirectRLEnv):
             return None
         elif self.render_mode == "rgb_array":
             # check that if any render could have happened
-            if self.sim.render_mode.value < self.sim.RenderMode.PARTIAL_RENDERING.value:
+            if not self.has_rtx_sensors:
                 raise RuntimeError(
-                    f"Cannot render '{self.render_mode}' when the simulation render mode is"
-                    f" '{self.sim.render_mode.name}'. Please set the simulation render mode to:"
-                    f"'{self.sim.RenderMode.PARTIAL_RENDERING.name}' or '{self.sim.RenderMode.FULL_RENDERING.name}'."
-                    " If running headless, make sure --enable_cameras is set."
+                    f"Cannot render '{self.render_mode}' without an RTX camera sensor."
+                    " If running headless, make sure cameras are enabled."
                 )
             # create the annotator if it does not exist
             if not hasattr(self, "_rgb_annotator"):
@@ -474,11 +477,18 @@ class UipcRLEnv(DirectRLEnv):
             # note: this is order-sensitive to avoid any dangling references
             if self.cfg.events:
                 del self.event_manager
+            cleanup_physics_callbacks = getattr(self, "_cleanup_physics_callbacks", None)
+            if callable(cleanup_physics_callbacks):
+                cleanup_physics_callbacks()
             del self.scene
             if self.viewport_camera_controller is not None:
                 del self.viewport_camera_controller
-            # clear callbacks and instance
-            self.sim.clear_all_callbacks()
+            # Isaac Lab 3 owns callback cleanup in ``clear_instance``.  Older
+            # Isaac Lab versions exposed ``clear_all_callbacks`` on the
+            # simulation context, so preserve that path only when present.
+            clear_all_callbacks = getattr(self.sim, "clear_all_callbacks", None)
+            if callable(clear_all_callbacks):
+                clear_all_callbacks()
             self.sim.clear_instance()
             # destroy the window
             if self._window is not None:

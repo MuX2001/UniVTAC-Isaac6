@@ -7,7 +7,7 @@
 
 ## Installation
 
-See the [Installation Guide](./docs/Installation.md) for detailed setup instructions, including installing the environment, installing TacEx from the modified local source and setting up cuRobo for motion planning.
+See the [Simulator and FTP1 Runtime Guide](./Installation_FTP1.md) for the current Docker simulator, FTP1 evaluation, dependency changes, and legacy source-build instructions. The meeting-ready [Isaac Sim 6 Migration and Runtime Guide](./docs/IsaacSim6_Migration_and_Runtime.md) explains the validated migrated runtime, and the [Validation Comparison](./docs/IsaacSim6_Validation_Comparison.md) separates confirmed agreement from the remaining differences.
 
 ## Task Gallery
 

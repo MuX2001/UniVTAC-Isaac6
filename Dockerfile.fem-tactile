@@ -1,0 +1,10 @@
+ARG BASE_IMAGE=user10/univtac-isaac60-lab3-tacex:ftp1-pytorch-runtime
+FROM ${BASE_IMAGE}
+
+# Required by TacEx's FEM tactile marker simulator.  Keep this isolated from
+# simulator-pinned packages: NumPy/SciPy, PyTorch, CUDA, Isaac Sim, and Isaac
+# Lab remain those from BASE_IMAGE.
+RUN /isaac-sim/python.sh -m pip install --no-cache-dir --no-deps \
+    joblib==1.5.2 \
+    threadpoolctl==3.6.0 \
+    scikit-learn==1.7.2

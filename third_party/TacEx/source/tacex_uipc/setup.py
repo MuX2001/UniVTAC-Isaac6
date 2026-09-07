@@ -76,9 +76,6 @@ class CMakeBuild(build_ext):
             "-DUIPC_BUILD_PYBIND=" + self.DUIPC_BUILD_PYBIND,  # per default = 1, i.e. true
             "-DUIPC_DEV_MODE=1",
             "-DUIPC_BUILD_GUI=0",
-            "-DUIPC_BUILD_EXAMPLES=0",
-            "-DUIPC_BUILD_TESTS=0",
-            "-DUIPC_BUILD_BENCHMARKS=0",
         ]
         # Pass vcpkg toolchain explicitly so pip build (possibly isolated) and stale CMakeCache don't use a wrong path
         toolchain = os.environ.get("CMAKE_TOOLCHAIN_FILE")

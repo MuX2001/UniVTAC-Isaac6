@@ -1,0 +1,23 @@
+# The portable image writes all generated data to the host-mounted /output path.
+# It preserves the normal contact collection settings; only the output location is
+# different from task_config/contact.yml.
+save_dir: /output/data
+
+decimation: 1
+
+save_frequency: 2
+video_frequency: 2
+render_frequency: 0
+
+random_texture: false
+
+use_seed: true
+episode_num: 1
+
+sensor_type: gsmini
+
+observations:
+  camera: ['rgb']
+  tactile: ['rgb', 'rgb_marker', 'marker', 'depth', 'pose']
+  embodiment: ['joint', 'ee']
+  actor: true

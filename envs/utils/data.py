@@ -3,6 +3,7 @@ import cv2
 import h5py
 import pickle
 import subprocess
+import shutil
 
 import torch
 import numpy as np
@@ -216,7 +217,7 @@ class HDF5Handler:
         for k, v in data.items():
             if isinstance(v, dict):
                 subgroup = node.create_group(k)
-                self.dict_to_hdf5(subgroup, v, encode_images=encode_images)
+                self.dict_to_hdf5(subgroup, v)
             elif isinstance(v, (list, np.ndarray)):
                 if "rgb" in k and encode_images:
                     v = np.array(v)
@@ -231,44 +232,65 @@ class HDF5Handler:
             else:
                 raise ValueError(f"Unsupported data type for key '{k}': {type(v)}")
         
-    def pkls_to_hdf5(self, pkl_dir, hdf5_path, encode_images=True):
-        """Convert collected frames to HDF5.
-
-        ``encode_images=False`` preserves RGB tensors exactly as produced by the
-        renderer. The default JPEG encoding is retained for regular dataset
-        collection, where disk use is more important than pixel identity.
-        """
+    def pkls_to_hdf5(self, pkl_dir, hdf5_path):
         data = self.gather(pkl_dir)
         with h5py.File(hdf5_path, "w") as f:
-            self.dict_to_hdf5(f, data, encode_images=encode_images)
+            self.dict_to_hdf5(f, data)
 
 class VideoHandler:
     def __init__(self):
         self.ffmpeg = None
+        self.video_writer = None
+        self.video_path = None
+        self.video_size = None
+
+    @property
+    def is_recording(self):
+        return self.ffmpeg is not None or self.video_writer is not None
         
     def reset(self, video_path, video_size):
-        if self.ffmpeg is not None:
+        if self.is_recording:
             self.close()
 
         self.video_path = Path(video_path)
         self.video_path.parent.mkdir(parents=True, exist_ok=True)
         self.video_size = video_size
         w, h = video_size
-        self.ffmpeg = subprocess.Popen([
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pixel_format", "rgb24",
-            "-video_size", f"{w}x{h}", "-framerate", "10",
-            "-i", "-", "-pix_fmt", "yuv420p",
-            "-vcodec", "libx264", "-crf", "18",  # 18 = higher quality (default 23)
-            "-movflags", "+faststart",
-            str(self.video_path)
-        ], stdin=subprocess.PIPE)
+        if shutil.which("ffmpeg") is not None:
+            self.ffmpeg = subprocess.Popen([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "rawvideo", "-pixel_format", "rgb24",
+                "-video_size", f"{w}x{h}", "-framerate", "10",
+                "-i", "-", "-pix_fmt", "yuv420p",
+                "-vcodec", "libx264", "-crf", "18",  # 18 = higher quality (default 23)
+                "-movflags", "+faststart",
+                str(self.video_path)
+            ], stdin=subprocess.PIPE)
+            return
+
+        # The pinned simulator image includes an OpenCV build with FFmpeg
+        # support, but it does not expose the standalone ffmpeg executable.
+        # Keep recording available through OpenCV without changing the image.
+        writer = cv2.VideoWriter(
+            str(self.video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            10,
+            (w, h),
+        )
+        if not writer.isOpened():
+            writer.release()
+            print("[VideoHandler] neither ffmpeg nor the OpenCV MP4 backend is available; skipping video recording.")
+            return
+        self.video_writer = writer
+        print("[VideoHandler] ffmpeg executable unavailable; recording MP4 through OpenCV.")
     
     def __del__(self):
-        if self.ffmpeg is not None:
+        if self.is_recording:
             self.close()
  
     def write(self, frame:torch.Tensor):
+        if not self.is_recording:
+            return
         frame = frame.cpu().numpy()
         # video_size is (width, height); frame is (height, width, 3)
         target_w, target_h = self.video_size
@@ -276,20 +298,32 @@ class VideoHandler:
             # Prefer INTER_AREA when downscaling for sharper video
             interp = cv2.INTER_AREA if (frame.shape[0] > target_h or frame.shape[1] > target_w) else cv2.INTER_LINEAR
             frame = cv2.resize(frame, (target_w, target_h), interpolation=interp)
-        self.ffmpeg.stdin.write(frame.tobytes())
+        frame = np.ascontiguousarray(frame)
+        if self.ffmpeg is not None:
+            self.ffmpeg.stdin.write(frame.tobytes())
+        else:
+            # VideoWriter expects BGR while simulator observations are RGB.
+            self.video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         # cv2.putText(frame, f'Streaming [{self.video_path.stem}]', (10, 30),
         #             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 0), 2)
         # self.stream.stdin.write(frame.tobytes())
     
     def forgive(self):
-        if self.ffmpeg is None: return
+        if not self.is_recording:
+            return
         self.close()
         self.video_path.unlink(missing_ok=True)
  
     def close(self, result:str=None):
-        self.ffmpeg.stdin.close()
-        self.ffmpeg.wait()
-        del self.ffmpeg
+        if not self.is_recording:
+            return
+        if self.ffmpeg is not None:
+            self.ffmpeg.stdin.close()
+            self.ffmpeg.wait()
+            self.ffmpeg = None
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
 
         # self.stream.stdin.close()
         # self.stream.wait()
@@ -298,4 +332,3 @@ class VideoHandler:
         if result is not None:
             new_name = self.video_path.parent / f"{self.video_path.stem}_{result}.mp4"
             self.video_path.rename(new_name)
-        self.ffmpeg = None

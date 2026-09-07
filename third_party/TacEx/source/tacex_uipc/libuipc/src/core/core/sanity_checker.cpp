@@ -9,10 +9,6 @@
 
 namespace uipc::core
 {
-// vcpkg's current dylib port exposes the loader as dylib::library.  Keep the
-// legacy local spelling used throughout this file.
-using dylib = ::dylib::library;
-
 static S<dylib> load_sanity_check_module()
 {
     static std::mutex m_cache_mutex;
@@ -25,9 +21,9 @@ static S<dylib> load_sanity_check_module()
 
     // if not found, load it
     auto& uipc_config = uipc::config();
-    auto this_module = uipc::make_shared<dylib>(
-        fmt::format("{}/uipc_sanity_check", uipc_config["module_dir"].get<std::string>()),
-        ::dylib::decorations::os_default());
+    auto  this_module =
+        uipc::make_shared<dylib>(uipc_config["module_dir"].get<std::string>(),
+                                 "uipc_sanity_check");
 
     std::string_view module_name = "sanity_check";
 

@@ -18,8 +18,6 @@ import carb
 import omni.ui
 import logging
 from contextlib import suppress
-from isaacsim.core.api.objects import VisualCuboid
-from isaacsim.core.prims import XFormPrim
 with suppress(ImportError):
     # isaacsim.gui is not available when running in headless mode.
     import isaacsim.gui.components.ui_utils as ui_utils
@@ -35,7 +33,8 @@ from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import FrameTransformer, FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
-from isaaclab.sim import PhysxCfg, RenderCfg, SimulationCfg
+from isaaclab.sim import RenderCfg, SimulationCfg
+from isaaclab_physx.physics import PhysxCfg
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
@@ -92,8 +91,9 @@ class BaseTaskCfg(DirectRLEnvCfg):
     save_frequency = 1
     video_frequency = 1
     render_frequency = 0
-    encode_images: bool = True
-    video_size = (960, 320)  # (width, height); keep 320 to avoid upscaling low-res camera (would look blocky)
+    # A 2x2 montage at the native 480x270 policy-camera size. This preserves
+    # camera aspect ratio and letterboxes the 4:3 tactile views.
+    video_size = (960, 540)
 
     ui_window_class_type = BaseEnvWindow
 
@@ -103,7 +103,7 @@ class BaseTaskCfg(DirectRLEnvCfg):
         dt=1/120,
         render_interval=decimation,
         # device="cpu",
-        physx=PhysxCfg(
+        physics=PhysxCfg(
             enable_ccd=True,  # needed for more stable ball_rolling
             # bounce_threshold_velocity=10000,
         ),
@@ -112,8 +112,8 @@ class BaseTaskCfg(DirectRLEnvCfg):
             restitution_combine_mode="multiply",
             restitution=0.0,
         ),
-        # 避免 A800 headless 下 "Render resolution below minimal input resolution of 300" 导致的模糊：
-        # 用 FXAA 完全不走 DLSS/DLAA 管线，不会触发低分辨率放大；若仍模糊可再检查各任务是否覆盖相机为 480x270
+        # Avoid the DLSS/DLAA minimum-input-resolution constraint.  The
+        # configured task set includes cameras below the DLSS/DLAA threshold.
         render=RenderCfg(
             rendering_mode="quality",
             enable_dl_denoiser=True,
@@ -176,6 +176,9 @@ class BaseTaskCfg(DirectRLEnvCfg):
             name="head",
             prim_path="/World/envs/env_.*/Camera",
             offset=CameraCfg.OffsetCfg(pos=(0.554, 1.0, 0.150), rot=(0, 0, 0.707, 0.707), convention="opengl"),
+            # Keep the authored eye position and resolve its viewing rotation
+            # from the scene geometry with Isaac Lab's convention-aware API.
+            look_at_target=(0.554, 0.0, 0.0),
             data_types=["rgb", "depth"],
             spawn=sim_utils.PinholeCameraCfg(
                 focal_length=1.94, focus_distance=1.0, horizontal_aperture=2.688, clipping_range=(0.01, 100.0)
@@ -240,6 +243,7 @@ class BaseTask(UipcRLEnv):
         self.mean_steps = 0
         self.take_action_cnt = 0
         self.plan_success = True
+        self.last_plan_failure = None
         self.eval_success = False
         self.in_pre_move = False
         self.last_qpos = None
@@ -318,6 +322,12 @@ class BaseTask(UipcRLEnv):
         self._camera_manager = CameraManager(self.cfg.cameras, self)
         self._tactile_manager = TactileManager(self.cfg.robot.tactiles, self)
 
+    def _cleanup_physics_callbacks(self):
+        """Release tactile attachment callbacks before the Lab physics view closes."""
+        tactile_manager = getattr(self, "_tactile_manager", None)
+        if tactile_manager is not None:
+            tactile_manager.close()
+
     def _setup_base_scene(self):
         # add robot
         self._robot_manager:RobotManager = RobotManager(
@@ -360,6 +370,7 @@ class BaseTask(UipcRLEnv):
         self.cfg.seed = seed
         self.rng = np.random.default_rng(seed)
         self._setup_save()
+        return seed
     
     def show_scene(self, actor_names:list[str]=None, show_next:bool=True):
         import trimesh
@@ -467,6 +478,7 @@ class BaseTask(UipcRLEnv):
         self._robot_manager._reset_idx()
 
         self.plan_success = True
+        self.last_plan_failure = None
         self.eval_success = False
         self.step_count = 0
         self.save_count = 0
@@ -487,10 +499,14 @@ class BaseTask(UipcRLEnv):
 
     def _update_render(self):
         self.uipc_sim.update_render_meshes()
+        self._camera_manager.update_attached_camera_poses()
         self.sim.render()
         
         dt = self.physics_dt * self.cfg.decimation * max(1, self.step_count - self.last_render)
         self.scene.update(dt=dt)
+        # Scene refresh reads static wrist-camera USD transforms in this
+        # runtime, so restore the live articulation-derived pose afterwards.
+        self._camera_manager.update_attached_camera_poses()
         self._actor_manager.update(dt=dt)
         self._tactile_manager.update(dt=dt, force_recompute=True)
  
@@ -499,22 +515,33 @@ class BaseTask(UipcRLEnv):
     def get_frame_shot(self, obs):
         head_obs = obs['observation']['head']['rgb'].clone()
         wrist_obs = obs['observation']['wrist']['rgb'].clone()
-        # Match video_size (960, 320): do not upscale (sim camera may be 224/320; upscale → blocky video)
-        tac_w, tac_h = 160, 320  # tactile on sides
-        img_h, cam_w = 320, 320  # center: head and wrist each 320
-        left_tac = torchvision.transforms.Resize((tac_h, tac_w))(
-            obs['tactile']['left_tactile']['rgb_marker'].clone().permute(2, 0, 1)).permute(1, 2, 0)
-        right_tac = torchvision.transforms.Resize((tac_h, tac_w))(
-            obs['tactile']['right_tactile']['rgb_marker'].clone().permute(2, 0, 1)).permute(1, 2, 0)
-        head_img = torchvision.transforms.Resize((img_h, cam_w))(head_obs.permute(2, 0, 1)).permute(1, 2, 0)
-        wrist_img = torchvision.transforms.Resize((img_h, cam_w))(wrist_obs.permute(2, 0, 1)).permute(1, 2, 0)
+        cell_h, cell_w = 270, 480
 
-        # Layout: [left_tac | head | wrist | right_tac], tactile on sides so camera view is unobstructed
-        img = torch.zeros((img_h, tac_w + cam_w * 2 + tac_w, 3), dtype=head_obs.dtype)
-        img[:, :tac_w] = left_tac
-        img[:, tac_w : tac_w + cam_w] = head_img
-        img[:, tac_w + cam_w : tac_w + cam_w * 2] = wrist_img
-        img[:, -tac_w:] = right_tac
+        def fit_to_cell(frame):
+            frame_h, frame_w = frame.shape[:2]
+            scale = min(cell_w / frame_w, cell_h / frame_h)
+            resized_h = max(1, round(frame_h * scale))
+            resized_w = max(1, round(frame_w * scale))
+            resized = torchvision.transforms.Resize((resized_h, resized_w), antialias=True)(
+                frame.permute(2, 0, 1)
+            ).permute(1, 2, 0)
+            cell = torch.zeros((cell_h, cell_w, 3), dtype=frame.dtype, device=frame.device)
+            top = (cell_h - resized_h) // 2
+            left = (cell_w - resized_w) // 2
+            cell[top : top + resized_h, left : left + resized_w] = resized
+            return cell
+
+        left_tac = fit_to_cell(obs['tactile']['left_tactile']['rgb_marker'].clone())
+        right_tac = fit_to_cell(obs['tactile']['right_tactile']['rgb_marker'].clone())
+        head_img = fit_to_cell(head_obs)
+        wrist_img = fit_to_cell(wrist_obs)
+
+        # Layout: head/wrist above, left/right tactile below.
+        img = torch.zeros((cell_h * 2, cell_w * 2, 3), dtype=head_obs.dtype, device=head_obs.device)
+        img[:cell_h, :cell_w] = head_img
+        img[:cell_h, cell_w:] = wrist_img
+        img[cell_h:, :cell_w] = left_tac
+        img[cell_h:, cell_w:] = right_tac
         return img
 
     @staticmethod
@@ -669,11 +696,7 @@ class BaseTask(UipcRLEnv):
  
     def save_to_hdf5(self):
         self.save_path.parent.mkdir(parents=True, exist_ok=True)
-        HDF5Handler().pkls_to_hdf5(
-            self.tmp_save_dir,
-            self.save_path,
-            encode_images=self.cfg.encode_images,
-        )
+        HDF5Handler().pkls_to_hdf5(self.tmp_save_dir, self.save_path)
     
     def _save_metadata(self):
         self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -753,6 +776,28 @@ class BaseTask(UipcRLEnv):
                 )
                 if control_seq['arm']['status'] == 'Fail':
                     self.logger.error(f'Arm motion planning failed on action {idx}: {action.__str__()}')
+                    def state_to_list(value):
+                        if hasattr(value, 'torch'):
+                            value = value.torch
+                        if isinstance(value, torch.Tensor):
+                            return value.detach().cpu().tolist()
+                        return np.asarray(value).tolist()
+
+                    robot_data = self._robot_manager.robot.data
+                    self.last_plan_failure = {
+                        'kind': 'arm_motion',
+                        'atom_id': int(self.atom_id),
+                        'atom_tag': self.atom_tag,
+                        'action_index': int(idx),
+                        'action': str(action),
+                        'target_pose_xyz_wxyz': action.target_pose.tolist(),
+                        'current_ee_pose_xyz_wxyz': state_to_list(
+                            self._robot_manager.get_ee_pose().totensor()
+                        ),
+                        'current_joint_position': state_to_list(robot_data.joint_pos[0]),
+                        'current_joint_velocity': state_to_list(robot_data.joint_vel[0]),
+                        'planner': control_seq['arm'].get('diagnostics'),
+                    }
                     if self.cfg.debug_vis:
                         add_visual_box(action.target_pose, 'failed_target')
                         self.delay(100)
@@ -1012,25 +1057,8 @@ class BaseTask(UipcRLEnv):
         actor_last_pose = actor.get_pose()
         max_trials = int(np.ceil(np.abs(dis/delta_d)))
         delta = np.sign(dis) * delta_d
-        for i in range(max_trials):
-            success = self.move(self.atom.move_by_displacement(
-                z=delta, xyz_coord='local'
-            ), tag='try_forward', is_save=is_save, delay=False, cosntraint_pose=[1, 1, 1, 1, 1, 0])
-            actor_pose = actor.get_pose()
-            if np.linalg.norm(actor_pose.p - actor_last_pose.p) < np.abs(delta):
-                return False
-            actor_last_pose = actor_pose
-        return True
-
-    def try_forward(self, actor:Actor, dis=0.01, delta_d=0.004, is_save=True):
-        if self.plan_success is False:
-            return False
-
-        actor_last_pose = actor.get_pose()
-        max_trials = int(np.ceil(np.abs(dis/delta_d)))
-        delta = np.sign(dis) * delta_d
-        for i in range(max_trials):
-            success = self.move(self.atom.move_by_displacement(
+        for _ in range(max_trials):
+            self.move(self.atom.move_by_displacement(
                 z=delta, xyz_coord='local'
             ), tag='try_forward', is_save=is_save, delay=False)
             actor_pose = actor.get_pose()

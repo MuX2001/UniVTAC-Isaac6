@@ -12,8 +12,8 @@ class TaskCfg(BaseTaskCfg):
             spawn=sim_utils.PinholeCameraCfg(
                 focal_length=2.5, focus_distance=1.0, horizontal_aperture=3.6, clipping_range=(0.1, 100.0)
             ),
-            width=480,
-            height=270,
+            width=640,
+            height=360,
             update_period=1/120
         ),
         CameraCfg(
@@ -21,8 +21,8 @@ class TaskCfg(BaseTaskCfg):
             prim_path="/World/envs/env_.*/Robot/WristCamera/Camera",
             data_types=["rgb", "depth"],
             spawn=None, # use existing camera
-            width=480,
-            height=270,
+            width=640,
+            height=360,
             update_period=1/120,
         )
     ]

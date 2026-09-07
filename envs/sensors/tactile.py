@@ -32,6 +32,15 @@ if TYPE_CHECKING:
     from tacex_uipc.sim import UipcIsaacAttachmentsCfg, UipcSim
     from tacex_uipc import UipcInteractiveScene
 
+
+def _as_torch(value):
+    """Convert Isaac Lab's Fabric proxy arrays only at the tactile pose-math boundary."""
+    if hasattr(value, "torch"):
+        return value.torch
+    if isinstance(value, torch.Tensor):
+        return value
+    return torch.as_tensor(value, device="cuda")
+
 @configclass
 class TactileCfg:
     name: str = 'tactile_sensor'
@@ -281,19 +290,23 @@ class VisualTactileSensor:
         self.sensor.marker_motion_simulator.marker_motion_sim.init_vertices()
 
     def get_attach_pose(self):
-        if type(self.attachment.isaaclab_rigid_object) is Articulation:
+        rigid_object = self.attachment.isaaclab_rigid_object
+        physics_view = getattr(rigid_object, "root_physx_view", None)
+        if physics_view is None:
+            physics_view = rigid_object._root_physx_view
+        if hasattr(physics_view, "get_link_transforms"):
             # this only works when rigid body is an articulation
             # self.attachment.isaaclab_rigid_object._physics_sim_view.update_articulations_kinematic()
             # read data from simulation
-            poses = self.attachment.isaaclab_rigid_object._root_physx_view.get_link_transforms().clone()
+            poses = _as_torch(physics_view.get_link_transforms()).clone()
             poses[..., 3:7] = math_utils.convert_quat(poses[..., 3:7], to="wxyz")
             pose = poses[:, self.attachment.rigid_body_id, 0:7].clone()
-        elif type(self.attachment.isaaclab_rigid_object) is RigidObject:
+        elif hasattr(physics_view, "root_state_w"):
             # only works with rigid body
-            pose = self.attachment.isaaclab_rigid_object._root_physx_view.root_state_w.view(-1, 1, 13)
+            pose = _as_torch(physics_view.root_state_w).view(-1, 1, 13)
             pose = pose[:, self.attachment.rigid_body_id, 0:7].clone()
         else:
-            raise RuntimeError("Need an Articulation or a RigidBody object for the Isaac X UIPC attachment.")
+            raise RuntimeError(f"Unsupported Isaac attachment physics view: {type(physics_view)!r}")
         return Pose.from_list(pose.flatten().tolist())
 
     def get_init_pts(self):
@@ -339,6 +352,9 @@ class VisualTactileSensor:
     def get_min_depth(self):
         return torch.min(self.sensor.data.output['height_map']).item()
 
+    def close(self):
+        self.attachment.close()
+
 class TactileManager:
     def __init__(self, cfg_list: list[TactileCfg], task:'BaseTask'):
         self.task = task
@@ -381,3 +397,7 @@ class TactileManager:
     def setup(self):
         for tact in self.tactiles.values():
             tact.setup()
+
+    def close(self):
+        for tact in self.tactiles.values():
+            tact.close()

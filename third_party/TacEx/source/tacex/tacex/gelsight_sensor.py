@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import numpy as np
 import torch
+import warp as wp
 from collections.abc import Sequence
 from matplotlib import pyplot as plt
 from typing import TYPE_CHECKING
@@ -10,8 +11,8 @@ from typing import TYPE_CHECKING
 import cv2
 import omni.kit.commands
 import omni.usd
-from isaacsim.core.prims import XFormPrim
-from pxr import Sdf
+from isaaclab.sim.views import FrameView
+from pxr import Gf, Sdf, UsdGeom
 
 from isaaclab.sensors import SensorBase, TiledCamera, TiledCameraCfg
 
@@ -29,8 +30,22 @@ if TYPE_CHECKING:
     from .gelsight_sensor_cfg import GelSightSensorCfg
 
 
+def _as_torch(value):
+    """Handle Isaac Lab 3's Torch, ProxyArray, and Warp-array sensor bookkeeping values."""
+    if isinstance(value, torch.Tensor):
+        return value
+    if hasattr(value, "torch"):
+        return value.torch
+    if hasattr(value, "warp"):
+        return wp.to_torch(value.warp)
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return torch.as_tensor(value, device="cuda")
+    return wp.to_torch(value)
+
+
 class GelSightSensor(SensorBase):
     cfg: GelSightSensorCfg
+    _all_gelpad_render_visibility = []
 
     def __init__(self, cfg: GelSightSensorCfg, gelpad_obj=None):
         # initialize base class
@@ -57,6 +72,15 @@ class GelSightSensor(SensorBase):
 
         # Flag to check that sensor is spawned.
         self._is_spawned = False
+        # One RTX annotator read is sufficient for both height_map and camera_depth
+        # during a sensor refresh.  The payload crosses the renderer boundary, so
+        # do not request it twice in the same frame.
+        self._rendered_depth_cache = None
+        # The tactile camera must render an approaching object, not the gelpad
+        # visual mesh that physically surrounds it.  Visibility is toggled only
+        # around that camera's renderer readback; UIPC simulation/collision data
+        # is never changed.
+        self._gelpad_render_visibility = []
 
         # initialize classes for GelSight simulation approaches for simulating GelSight sensor output
         if self.cfg.optical_sim_cfg is not None:
@@ -192,7 +216,9 @@ class GelSightSensor(SensorBase):
             self.marker_motion_simulator.reset()
 
         # Reset the frame count
-        self._frame[env_ids] = 0
+        frame = _as_torch(self._frame)
+        frame[_as_torch(env_ids)] = 0
+        self._frame = frame
 
     ####
     # Implementation of abstract methods of base sensor class
@@ -205,14 +231,20 @@ class GelSightSensor(SensorBase):
         # Initialize parent class
         super()._initialize_impl()
 
-        self._prim_view = XFormPrim(prim_paths_expr=self.cfg.prim_path, name=f"{self.cfg.prim_path}", usd=False)
-        self._prim_view.initialize()
+        self._prim_view = FrameView(self.cfg.prim_path, device=self._device)
         # Check that sizes are correct
         if self._prim_view.count != self._num_envs:
             raise RuntimeError(
                 f"Number of sensor prims in the view ({self._prim_view.count}) does not match"
                 f" the number of environments ({self._num_envs})."
             )
+
+        # ``spawn=None`` preserves the authored GelSight camera.  Therefore a
+        # clipping range on SensorCameraCfg alone never reaches the RTX camera.
+        # Make the existing camera use the same interval as the depth/optical
+        # preprocessing below.  This is an observation-path correction only;
+        # it does not change any UIPC/PhysX body, constraint, or task action.
+        self._synchronize_authored_camera_clipping_range()
 
         # set device, if specified (per default the same as the simulation)
         if self.cfg.device is not None:
@@ -234,7 +266,8 @@ class GelSightSensor(SensorBase):
                 data_types=self.cfg.sensor_camera_cfg.data_types,
                 update_latest_camera_pose=True,  # needed for FEM based marker sim
                 spawn=None,  # use camera which is part of the GelSight Mini Asset
-                # note: clipping range doesn't matter for existing camera prim -> only applied when camera is spawned # TODO fix?
+                # Its authored clipping range is synchronized from the sensor
+                # config immediately above, before the RTX annotator is made.
                 # spawn=sim_utils.PinholeCameraCfg(
                 #    focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.1, 1.0e5)
                 # ),
@@ -260,6 +293,23 @@ class GelSightSensor(SensorBase):
             # need to initialize the camera manually, since its not part of the scene cfg
             self.camera._initialize_impl()
             self.camera._is_initialized = True
+
+        if self.gelpad_obj is not None:
+            prim_view = getattr(self.gelpad_obj, "_prim_view", None)
+
+            def mesh_visibility_attrs(prim):
+                attributes = []
+                if prim.IsA(UsdGeom.Mesh):
+                    visibility = UsdGeom.Imageable(prim).GetVisibilityAttr()
+                    if visibility:
+                        attributes.append((visibility, visibility.Get()))
+                for child in prim.GetChildren():
+                    attributes.extend(mesh_visibility_attrs(child))
+                return attributes
+
+            for prim in getattr(prim_view, "prims", []):
+                self._gelpad_render_visibility.extend(mesh_visibility_attrs(prim))
+            GelSightSensor._all_gelpad_render_visibility.extend(self._gelpad_render_visibility)
 
         self._data.output["height_map"] = torch.zeros(
             (self._num_envs, self.camera_cfg.height, self.camera_cfg.width), device=self.cfg.device
@@ -359,30 +409,57 @@ class GelSightSensor(SensorBase):
         This function reads ...
 
         """
+        # The direct RTX depth payload is refreshed below after the camera update.
+        # It must not survive across sensor frames.
+        self._rendered_depth_cache = None
+
         # -- pose
         # self._data.position = self._sensor_prim.GetAttribute("xformOp:translate").Get()
         # self._data.orientation = self._sensor_prim.GetAttribute(
         #     "xformOp:rotation"
         # ).Get()
 
-        self._frame[env_ids] += 1
+        frame = _as_torch(self._frame)
+        frame[_as_torch(env_ids)] += 1
+        self._frame = frame
 
         # -- update camera buffer
-        if self.camera is not None:
-            self.camera._timestamp = self._timestamp
-            self.camera.update(dt=0, force_recompute=True)
+        # A GelSight camera can also see the opposite pad across the narrow
+        # gripper opening.  Hide all visual gel meshes for this dedicated
+        # tactile readback, then restore them before any other rendering.
+        for visibility, _ in GelSightSensor._all_gelpad_render_visibility:
+            visibility.Set(UsdGeom.Tokens.invisible)
+        try:
+            if self.camera is not None:
+                # The UIPC gelpad is constrained to the robot, whereas its embedded
+                # USD camera is not.  Carry the renderer camera with the measured
+                # rigid gelpad motion before requesting RTX RGB/depth.  This changes
+                # only the observation camera pose; it does not alter UIPC state,
+                # task actions, or physics parameters.
+                if self.marker_motion_simulator is not None:
+                    marker_motion_sim = getattr(self.marker_motion_simulator, "marker_motion_sim", None)
+                    if marker_motion_sim is not None and hasattr(marker_motion_sim, "get_moving_camera_world_pose"):
+                        camera_pos_w, camera_quat_w_ros = marker_motion_sim.get_moving_camera_world_pose()
+                        self.camera.set_world_poses(
+                            positions=camera_pos_w, orientations=camera_quat_w_ros, convention="ros"
+                        )
+                self.camera._timestamp = self._timestamp
+                self.camera.update(dt=0, force_recompute=True)
 
-        if self.compute_indentation_depth_func is not None:
-            # -- height_map
-            self._get_height_map()
-            # -- pressing depth
-            self._indentation_depth[:] = self.compute_indentation_depth_func()  # type: ignore #todo uncomment
+            if self.compute_indentation_depth_func is not None:
+                # -- height_map
+                self._get_height_map()
+                # -- pressing depth
+                self._indentation_depth[:] = self.compute_indentation_depth_func()  # type: ignore #todo uncomment
 
-        if "camera_depth" in self._data.output:
-            self._get_camera_depth()
+            if "camera_depth" in self._data.output:
+                self._get_camera_depth()
 
-        if "camera_rgb" in self._data.output:
-            self._data.output["camera_rgb"][:] = self.camera.data.output["rgb"]
+            if "camera_rgb" in self._data.output:
+                self._data.output["camera_rgb"][:] = self.camera.data.output["rgb"]
+        finally:
+            for visibility, previous_value in GelSightSensor._all_gelpad_render_visibility:
+                visibility.Set(previous_value or UsdGeom.Tokens.inherited)
 
         if (self.optical_simulator is not None) and ("tactile_rgb" in self.cfg.data_types):
             # self.optical_simulator.height_map = self._data.output["height_map"]
@@ -587,11 +664,99 @@ class GelSightSensor(SensorBase):
     #     self._data.pos_w[env_ids] = poses
     #     self._data.quat_w_world[env_ids] = convert_orientation_convention(quat, origin="opengl", target="world")
 
+    def _get_rendered_depth(self):
+        """Return the nested tactile camera depth in metres.
+
+        Isaac Sim 6's RTX depth annotator is valid for the embedded GelSight
+        cameras, but Isaac Lab 3's intermediate single-view output buffer can
+        contain corrupted finite values after its tiled-buffer copy.  For this
+        project's one-environment workflow, read the annotator payload directly
+        and retain the standard Camera buffer as the multi-environment fallback.
+        """
+        if self._rendered_depth_cache is not None:
+            return self._rendered_depth_cache
+
+        depth_output = self.camera.data.output["depth"][:, :, :, 0]
+        if self._num_envs != 1:
+            self._rendered_depth_cache = depth_output
+            return self._rendered_depth_cache
+
+        render_data = getattr(self.camera, "_render_data", None)
+        annotators = getattr(render_data, "annotators", None)
+        depth_annotator = annotators.get("depth") if annotators is not None else None
+        if depth_annotator is None:
+            self._rendered_depth_cache = depth_output
+            return self._rendered_depth_cache
+
+        depth_payload = depth_annotator.get_data()
+        if isinstance(depth_payload, dict):
+            depth_payload = depth_payload["data"]
+        depth_payload = _as_torch(depth_payload)
+        if depth_payload.ndim == 3 and depth_payload.shape[-1] == 1:
+            depth_payload = depth_payload[..., 0]
+        if depth_payload.shape != (self.camera_resolution[1], self.camera_resolution[0]):
+            self._rendered_depth_cache = depth_output
+            return self._rendered_depth_cache
+        self._rendered_depth_cache = depth_payload.unsqueeze(0)
+        return self._rendered_depth_cache
+
+    def get_camera_plane_diagnostics(self):
+        """Return authored USD camera-plane values for an opt-in runtime audit.
+
+        The sensor configuration's clipping range is not authored automatically
+        because this camera comes from the GelSight USD asset (``spawn=None``).
+        Reading these values lets the validation capture identify whether a
+        depth boundary is produced by the renderer's authored camera plane.
+        This method is read-only and does not request a render or alter USD.
+        """
+        if self._prim_view is None or self.cfg.sensor_camera_cfg is None:
+            return []
+        stage = omni.usd.get_context().get_stage()
+        suffix = self.cfg.sensor_camera_cfg.prim_path_appendix.lstrip("/")
+        diagnostics = []
+        for sensor_prim in self._prim_view.prims:
+            camera_path = sensor_prim.GetPath().AppendPath(suffix)
+            camera = UsdGeom.Camera(stage.GetPrimAtPath(camera_path))
+            if not camera.GetPrim().IsValid():
+                diagnostics.append({"camera_path": str(camera_path), "valid": False})
+                continue
+            clipping_range = camera.GetClippingRangeAttr().Get()
+            diagnostics.append(
+                {
+                    "camera_path": str(camera_path),
+                    "valid": True,
+                    "authored_clipping_range_m": None
+                    if clipping_range is None
+                    else [float(clipping_range[0]), float(clipping_range[1])],
+                    "focal_length": float(camera.GetFocalLengthAttr().Get()),
+                    "horizontal_aperture": float(camera.GetHorizontalApertureAttr().Get()),
+                    "vertical_aperture": float(camera.GetVerticalApertureAttr().Get()),
+                }
+            )
+        return diagnostics
+
+    def _synchronize_authored_camera_clipping_range(self):
+        """Apply the configured observation range to an existing USD camera."""
+        if self._prim_view is None or self.cfg.sensor_camera_cfg is None:
+            return
+        near_plane, far_plane = self.cfg.sensor_camera_cfg.clipping_range
+        if not 0.0 < near_plane < far_plane:
+            raise ValueError(f"Invalid tactile camera clipping range: {(near_plane, far_plane)}")
+        stage = omni.usd.get_context().get_stage()
+        suffix = self.cfg.sensor_camera_cfg.prim_path_appendix.lstrip("/")
+        desired_range = Gf.Vec2f(float(near_plane), float(far_plane))
+        for sensor_prim in self._prim_view.prims:
+            camera_path = sensor_prim.GetPath().AppendPath(suffix)
+            camera = UsdGeom.Camera(stage.GetPrimAtPath(camera_path))
+            if not camera.GetPrim().IsValid():
+                raise RuntimeError(f"Missing tactile camera prim: {camera_path}")
+            current_range = camera.GetClippingRangeAttr().Get()
+            if current_range is None or tuple(float(value) for value in current_range) != tuple(desired_range):
+                camera.GetClippingRangeAttr().Set(desired_range)
+
     def _get_camera_depth(self):
         if self.camera is not None:
-            depth_output = self.camera.data.output["depth"][
-                :, :, :, 0
-            ]  # tiled camera gives us data with shape (num_cameras, height, width, num_channels),
+            depth_output = self._get_rendered_depth().clone()
             # clip camera values that are = inf
             depth_output[torch.isinf(depth_output)] = self.cfg.sensor_camera_cfg.clipping_range[1]
 
@@ -613,9 +778,7 @@ class GelSightSensor(SensorBase):
 
     def _get_height_map(self):
         if self.camera is not None:
-            self._data.output["height_map"][:] = self.camera.data.output["depth"][
-                :, :, :, 0
-            ]  # tiled camera gives us data with shape (num_cameras, height, width, num_channels),
+            self._data.output["height_map"][:] = self._get_rendered_depth()
             # clip camera values that are = inf
             self._data.output["height_map"][torch.isinf(self._data.output["height_map"])] = (
                 self.cfg.sensor_camera_cfg.clipping_range[1]

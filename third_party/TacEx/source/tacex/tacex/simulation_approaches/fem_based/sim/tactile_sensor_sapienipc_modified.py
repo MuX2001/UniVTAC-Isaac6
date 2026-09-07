@@ -28,7 +28,7 @@ import isaaclab.utils.math as math_utils
 from tacex_uipc.objects import UipcObject
 from tacex_uipc.sim import UipcSim
 
-from .utils.geometry import in_hull
+from .utils.geometry import estimate_rigid_transform, in_hull
 
 try:
     from isaacsim.util.debug_draw import _debug_draw
@@ -90,7 +90,22 @@ class VisionTactileSensorUIPC:
             self.constrain_ids = CONSTRAIN_PTS[self.sensor_type]
             self.faces_on_surfaces = SURFACE_FACES[self.sensor_type]
         self.vertices_on_surface = np.sort(np.unique(self.faces_on_surfaces.flatten()))
+        # The UIPC gelpad mesh is expressed in world coordinates.  The renderer
+        # camera asset is not parented to that moving mesh, so retain the
+        # constrained bottom vertices as an unambiguous reference for the
+        # gelpad's rigid body motion.
+        self.init_constrain_vertices_world = (
+            self.get_vertices_world()[self.constrain_ids].detach().cpu().numpy().copy()
+        )
         self.init_surface_vertices = self.get_surface_vertices_world()
+
+        # The USD camera is not parented to the UIPC gel mesh.  Save its original
+        # ROS-frame pose before the renderer-side moving-frame correction is
+        # applied.  Marker coordinates continue to use this immutable reference
+        # frame, so moving the renderer camera cannot double-transform markers.
+        self.camera._update_poses(self.camera._ALL_INDICES)
+        self.initial_camera_pos_w = self.camera._data.pos_w.torch.clone()
+        self.initial_camera_quat_w_ros = self.camera._data.quat_w_ros.torch.clone()
 
         self.marker_shape = marker_shape
         self.tactile_img_width = tactile_img_width
@@ -140,20 +155,52 @@ class VisionTactileSensorUIPC:
         surf_v = all_v[self.vertices_on_surface]
         return surf_v
 
-    # todo find out what's wrong with this method -> frame coor. sys. seems to be wrong
-    def transform_camera_to_world_frame(self, input_vertices):
-        self.camera._update_poses(self.camera._ALL_INDICES)
-        # math_utils.convert_camera_frame_orientation_convention
-        cam_pos_w = self.camera._data.pos_w
-        cam_quat_w = self.camera._data.quat_w_ros  # quat_w_opengl#quat_w_world
-        v_cv = math_utils.transform_points(input_vertices, pos=cam_pos_w, quat=cam_quat_w)
-        return v_cv
+    def _moving_gelpad_transform(self):
+        """Return the row-vector rigid transform from initial to current gelpad world frame."""
+        current_constrain_vertices = self.get_vertices_world()[self.constrain_ids].detach().cpu().numpy()
+        rotation, translation = estimate_rigid_transform(
+            self.init_constrain_vertices_world, current_constrain_vertices
+        )
+        residual = self.init_constrain_vertices_world @ rotation + translation - current_constrain_vertices
+        self.last_marker_rigid_fit_rms_m = float(np.sqrt(np.mean(residual**2)))
+        self.last_marker_rigid_fit_max_m = float(np.max(np.abs(residual)))
+        # Expose the reconstructed moving frame for opt-in runtime validation.
+        # These values are diagnostics only; the simulation state is not altered.
+        self.last_gelpad_rotation_world_from_initial = rotation
+        self.last_gelpad_translation_world_from_initial = translation
+        return rotation, translation
 
-    def transform_world_to_camera_frame(self, input_vertices):
-        self.camera._update_poses(self.camera._ALL_INDICES)
-        # math_utils.convert_camera_frame_orientation_convention
-        cam_pos_w = self.camera._data.pos_w
-        cam_quat_w = self.camera._data.quat_w_ros
+    def get_moving_camera_world_pose(self):
+        """Return the camera pose rigidly carried by the UIPC gelpad.
+
+        The returned orientation uses Isaac Lab's ROS camera convention
+        ``(x, y, z, w)``.  It is intended solely for the RTX renderer camera;
+        UIPC objects and task physics are not modified.
+        """
+        rotation, translation = self._moving_gelpad_transform()
+        rotation_t = torch.as_tensor(
+            rotation, device=self.initial_camera_pos_w.device, dtype=self.initial_camera_pos_w.dtype
+        )
+        translation_t = torch.as_tensor(
+            translation, device=self.initial_camera_pos_w.device, dtype=self.initial_camera_pos_w.dtype
+        )
+
+        position = self.initial_camera_pos_w @ rotation_t + translation_t
+        initial_rotation = math_utils.matrix_from_quat(self.initial_camera_quat_w_ros)
+        # ``rotation`` maps row-vector initial world points to current world
+        # points.  For the column-vector rotation matrix stored in a quaternion,
+        # the corresponding moving camera orientation is R.T @ Q_initial.
+        orientation = math_utils.quat_from_matrix(rotation_t.T @ initial_rotation)
+        return position, orientation
+
+    def _static_camera_to_world_frame(self, input_vertices):
+        cam_pos_w = self.initial_camera_pos_w
+        cam_quat_w = self.initial_camera_quat_w_ros
+        return math_utils.transform_points(input_vertices, pos=cam_pos_w, quat=cam_quat_w)
+
+    def _static_world_to_camera_frame(self, input_vertices):
+        cam_pos_w = self.initial_camera_pos_w
+        cam_quat_w = self.initial_camera_quat_w_ros
         cam_quat_w_inv = math_utils.quat_inv(cam_quat_w)
 
         rot_inv = math_utils.matrix_from_quat(cam_quat_w_inv)
@@ -170,6 +217,31 @@ class VisionTactileSensorUIPC:
         # todo fix it for multi env
         v_cv = v_cv[0]
         return v_cv
+
+    def transform_camera_to_world_frame(self, input_vertices):
+        """Map the moving gelpad camera coordinates to UIPC world coordinates."""
+        initial_world_vertices = self._static_camera_to_world_frame(input_vertices)
+        rotation, translation = self._moving_gelpad_transform()
+        current_world_vertices = initial_world_vertices.detach().cpu().numpy() @ rotation + translation
+        return torch.as_tensor(
+            current_world_vertices, device=initial_world_vertices.device, dtype=initial_world_vertices.dtype
+        )
+
+    def transform_world_to_camera_frame(self, input_vertices):
+        """Map UIPC world coordinates into the gelpad's moving camera frame.
+
+        The embedded TiledCamera pose remains at its initial USD transform while
+        the UIPC mesh moves.  Undo the measured gelpad rigid motion before
+        applying that static camera transform.  This mirrors the moving-frame
+        reconstruction in the upstream tactile implementation and affects only
+        observation coordinates.
+        """
+        rotation, translation = self._moving_gelpad_transform()
+        initial_world_vertices = (input_vertices.detach().cpu().numpy() - translation) @ rotation.T
+        initial_world_vertices = torch.as_tensor(
+            initial_world_vertices, device=input_vertices.device, dtype=input_vertices.dtype
+        )
+        return self._static_world_to_camera_frame(initial_world_vertices)
 
     def get_init_surface_vertices_camera(self):
         return self.transform_world_to_camera_frame(self.get_surface_vertices_world()).clone()
@@ -328,6 +400,12 @@ class VisionTactileSensorUIPC:
             self.get_vertices_camera()[self.constrain_ids].cpu().numpy() - self.constrain_pts, axis=0)
         curr_marker_pts[:, :2] -= mean_motion[:2]
 
+        # Keep the already-computed geometry available to the opt-in runtime
+        # probe.  These fields are diagnostic only and are not consumed by the
+        # marker simulation or task logic.
+        self.last_marker_initial_points_camera = init_marker_pts
+        self.last_marker_current_points_camera = curr_marker_pts
+
         init_marker_uv = self.gen_marker_uv(init_marker_pts)
         curr_marker_uv = self.gen_marker_uv(curr_marker_pts)
         marker_mask = np.logical_and.reduce([
@@ -336,6 +414,7 @@ class VisionTactileSensorUIPC:
             curr_marker_uv[:, 1] > 0,
             curr_marker_uv[:, 1] < self.tactile_img_height,
         ])
+        self.last_marker_in_bounds = marker_mask
         marker_flow = np.stack([init_marker_uv, curr_marker_uv], axis=0)
         marker_flow = marker_flow[:, marker_mask]
 

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 class ActorCfg(UipcObjectCfg):
     name: str = 'actor'
     asset: str = None
+    use_initial_state_transform: bool = True
     center: tuple[float, float, float] = (0.0, 0.0, 0.0)
     extents: tuple[float, float, float] = (0.1, 0.1, 0.1)
 

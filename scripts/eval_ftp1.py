@@ -1088,8 +1088,13 @@ def _worker_main(
     parser = argparse.ArgumentParser(add_help=False)
     AppLauncher.add_app_launcher_args(parser)
     app_args = parser.parse_args([])  # defaults
+    # Batch evaluation runs on display-less Slurm nodes. Keep cameras for policy observations,
+    # but do not start a WebRTC viewport or livestream.
+    app_args.headless = True
+    app_args.experience = "isaaclab.python.headless.rendering.kit"
+    app_args.kit_args = "--reset-user"
     app_args.enable_cameras = True
-    app_args.livestream = 2
+    app_args.livestream = 0
     app_args.num_envs = 1
     # 强制 quality 渲染，减少 RTX 杂点（大显存机上 FTP1+Isaac 同 GPU 时易出现噪点）
     if hasattr(app_args, "rendering_mode"):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import pathlib
+import os
+import time
 
 import omni.usd
 import usdrt
@@ -8,6 +10,7 @@ import usdrt.Usd
 from pxr import UsdGeom
 
 import isaaclab.sim as sim_utils
+from isaaclab_physx.physics import IsaacEvents
 from isaaclab.utils import configclass
 
 try:
@@ -138,6 +141,16 @@ class UipcSim:
         """Initialize the uipc simulation."""
         # will be initialized in `setup_sim()`
         self.isaac_sim = None
+        self._physics_step_handle = None
+        # Disabled by default.  A bounded local runtime validation can opt in to
+        # timing the existing UIPC operations without changing their order or
+        # any simulation settings.
+        self._profile_step_limit = int(os.environ.get("UIPC_STEP_PROFILE_LIMIT", "0"))
+        self._profile_step_count = 0
+        # Sequence marker for attachment-order diagnostics.  This is only read
+        # by the attachment telemetry; it does not affect the UIPC step.
+        self._post_physics_step_serial = 0
+        self._post_physics_step_phase = "idle"
 
         if cfg is None:
             cfg = UipcSimCfg()
@@ -220,6 +233,9 @@ class UipcSim:
 
     def __del__(self):
         """Unsubscribe from the callbacks."""
+        if self._physics_step_handle:
+            self._physics_step_handle.deregister()
+            self._physics_step_handle = None
         # clear debug visualization
         if self._debug_vis_handle:
             self._debug_vis_handle.unsubscribe()
@@ -269,11 +285,27 @@ class UipcSim:
 
         # initialize callbacks
         self.isaac_sim: sim_utils.SimulationContext = sim_utils.SimulationContext.instance()
-        self.isaac_sim.add_physics_callback("uicp_step", self.step)
+        self._physics_step_handle = self.isaac_sim.physics_manager.register_callback(
+            self.step, IsaacEvents.POST_PHYSICS_STEP, name="uipc_step"
+        )
 
     def step(self, dt=0):
+        self._post_physics_step_serial += 1
+        self._post_physics_step_phase = "uipc_advance"
+        start = time.perf_counter()
         self.world.advance()
+        advance_s = time.perf_counter() - start
         self.world.retrieve()
+        retrieve_s = time.perf_counter() - start - advance_s
+        self._post_physics_step_phase = "after_uipc_advance"
+        self._profile_step_count += 1
+        if self._profile_step_count <= self._profile_step_limit:
+            print(
+                "[UIPC_STEP_PROFILE] "
+                f"step={self._profile_step_count} advance_s={advance_s:.6f} "
+                f"retrieve_s={retrieve_s:.6f} total_s={advance_s + retrieve_s:.6f}",
+                flush=True,
+            )
 
     def reset(self):
         # self.world.recover(0) # go back to frame 0

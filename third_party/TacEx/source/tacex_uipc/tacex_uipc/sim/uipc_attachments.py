@@ -7,9 +7,10 @@ import weakref
 
 import omni
 from omni.physx import get_physx_interface, get_physx_scene_query_interface
-from pxr import UsdGeom, UsdPhysics
+from pxr import Usd, UsdGeom, UsdPhysics
 
 import isaaclab.sim as sim_utils
+from isaaclab.physics import PhysicsEvent, PhysicsManager
 
 try:
     from isaacsim.util.debug_draw import _debug_draw
@@ -97,6 +98,27 @@ class UipcIsaacAttachments:
 
         # self.attachments_offsets_idx_range = [0]
         self.aim_positions = np.zeros(0)
+        # Read-only diagnostics for bounded validation runs.  These counters
+        # must not influence the UIPC constraint or its scheduling.
+        self.diagnostic_data = {
+            "body_name": self.cfg.body_name,
+            "configured_rigid_prim_path": self.cfg.isaac_rigid_prim_path,
+            "rigid_object_prim_path": self.isaaclab_rigid_object.cfg.prim_path,
+            "constraint_strength_ratio": float(self.cfg.constraint_strength_ratio),
+            "attachment_points_radius_m": float(self.cfg.attachment_points_radius),
+        }
+        self._aim_callback_count = 0
+        self._animation_callback_count = 0
+        self._last_animation_aim_generation = -1
+        self._last_aim_callback_dt = None
+        # Read-only timing trace.  The serial belongs to UipcSim.step() and
+        # lets validation distinguish a target updated before the UIPC advance
+        # from one updated after it.
+        self._last_aim_uipc_step_serial = -1
+        self._last_aim_uipc_step_phase = "unknown"
+        self._last_animation_uipc_step_serial = -1
+        self._last_animation_uipc_step_phase = "unknown"
+        self._found_body_names = []
 
         # create the attachment
 
@@ -135,8 +157,13 @@ class UipcIsaacAttachments:
                 mesh = self.uipc_object.uipc_meshes[0]
                 tet_points_world = mesh.positions().view()[:, :, 0]
                 tet_indices = mesh.tetrahedra().topo().view()[:, :, 0]
+                self.diagnostic_data["resolved_rigid_prim_path"] = isaac_rigid_prim_path
                 attachment_offsets, idx, rigid_prims, attachment_points_pos, obj_pos = self.compute_attachment_data(
-                    isaac_rigid_prim_path, tet_points_world, tet_indices, attachment_points_radius
+                    isaac_rigid_prim_path,
+                    tet_points_world,
+                    tet_indices,
+                    attachment_points_radius,
+                    diagnostics=self.diagnostic_data,
                 )
             else:
                 # compute attachment
@@ -157,11 +184,18 @@ class UipcIsaacAttachments:
                     isaac_rigid_prim_path, tet_points_world, tet_indices, att_ids
                 )
                 idx = list(att_ids)
+                self.diagnostic_data.update(
+                    {
+                        "resolved_rigid_prim_path": isaac_rigid_prim_path,
+                        "attachment_source": "precomputed_indices",
+                    }
+                )
 
         # set attachment data
         self.attachment_offsets = attachment_offsets
         self.attachment_points_idx = idx
         self.num_attachment_points_per_obj = len(idx)
+        self.diagnostic_data["attachment_point_count"] = int(self.num_attachment_points_per_obj)
 
         self._num_instances = 1
 
@@ -173,38 +207,40 @@ class UipcIsaacAttachments:
         # flag for whether the asset is initialized
         self._is_initialized = False
 
-        # note: Use weakref on all callbacks to ensure that this object can be deleted when its destructor is called.
-        # add callbacks for stage play/stop
-        # The order is set to 10 which is arbitrary but should be lower priority than the default order of 0
-        timeline_event_stream = omni.timeline.get_timeline_interface().get_timeline_event_stream()
-        self._initialize_handle = timeline_event_stream.create_subscription_to_pop_by_type(
-            int(omni.timeline.TimelineEventType.PLAY),
-            lambda event, obj=weakref.proxy(self): obj._initialize_callback(event),
-            order=10,
+        # Physics handles are valid only after the Isaac Lab backend has reached
+        # PHYSICS_READY.  Timeline PLAY can fire too early on Isaac Sim 6.
+        physics_mgr = sim_utils.SimulationContext.instance().physics_manager
+        self._initialize_handle = physics_mgr.register_callback(
+            self._initialize_callback, PhysicsEvent.PHYSICS_READY, order=10
         )
-        self._invalidate_initialize_handle = timeline_event_stream.create_subscription_to_pop_by_type(
-            int(omni.timeline.TimelineEventType.STOP),
-            lambda event, obj=weakref.proxy(self): obj._invalidate_initialize_callback(event),
-            order=10,
+        self._invalidate_initialize_handle = physics_mgr.register_callback(
+            self._invalidate_initialize_callback, PhysicsEvent.STOP, order=10
         )
+        self._aim_position_handle = None
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self._debug_vis_handle = None
         # set initial state of debug visualization
         self.set_debug_vis(self.cfg.debug_vis)
 
-    def __del__(self):
-        """Unsubscribe from the callbacks."""
+    def close(self):
+        """Unsubscribe before Isaac Lab invalidates its physics views."""
         # clear physics events handles
         if self._initialize_handle:
-            self._initialize_handle.unsubscribe()
+            self._initialize_handle.deregister()
             self._initialize_handle = None
         if self._invalidate_initialize_handle:
-            self._invalidate_initialize_handle.unsubscribe()
+            self._invalidate_initialize_handle.deregister()
             self._invalidate_initialize_handle = None
+        if self._aim_position_handle:
+            self._aim_position_handle.deregister()
+            self._aim_position_handle = None
         # clear debug visualization
         if self._debug_vis_handle:
             self._debug_vis_handle.unsubscribe()
             self._debug_vis_handle = None
+
+    def __del__(self):
+        self.close()
 
     """
     Properties
@@ -275,7 +311,7 @@ class UipcIsaacAttachments:
 
     @staticmethod
     def compute_attachment_data(
-        isaac_mesh_path, tet_points, tet_indices, sphere_radius=5e-4, max_dist=1e-5
+        isaac_mesh_path, tet_points, tet_indices, sphere_radius=5e-4, max_dist=1e-5, diagnostics: dict | None = None
     ):  # really small distances to prevent intersection with unwanted geometries
         """
 
@@ -299,14 +335,37 @@ class UipcIsaacAttachments:
                 f"Could not find prim with path {isaac_mesh_path}. The body_name in the cfg might not exist."
             )
         init_prim = matching_prims[0]
+        if diagnostics is not None:
+            diagnostics.update(
+                {
+                    "attachment_source": "physx_scene_query",
+                    "matching_rigid_prim_paths": [str(prim.GetPath()) for prim in matching_prims],
+                    "initial_rigid_prim_path": str(init_prim.GetPath()),
+                    "physx_sweep_radius_m": float(sphere_radius),
+                    "physx_sweep_distance_m": float(max_dist),
+                    "collision_meshes": [],
+                }
+            )
 
         pose = omni.usd.get_world_transform_matrix(init_prim)
         obj_position = pose.ExtractTranslation()
         obj_position = np.array([obj_position])
+        if diagnostics is not None:
+            diagnostics["initial_rigid_position_m"] = obj_position.reshape(-1).astype(float).tolist()
 
         q = pose.ExtractRotation().GetQuaternion()
-        obj_orientation = [q.GetReal(), q.GetImaginary()[0], q.GetImaginary()[1], q.GetImaginary()[2]]
-        obj_orientation = torch.tensor(np.array([obj_orientation]), device="cuda:0").float()
+        # USD exposes quaternions as (w, x, y, z), while Isaac Lab's
+        # quat_apply_inverse uses (x, y, z, w).  Store attachment offsets in
+        # the same local frame used by the runtime target transform.
+        obj_orientation_wxyz = [
+            q.GetReal(),
+            q.GetImaginary()[0],
+            q.GetImaginary()[1],
+            q.GetImaginary()[2],
+        ]
+        obj_orientation = math_utils.convert_quat(
+            torch.tensor(np.array([obj_orientation_wxyz]), device="cuda:0").float(), to="xyzw"
+        )
 
         idx = []
         attachment_points_positions = []
@@ -327,6 +386,14 @@ class UipcIsaacAttachments:
         vertex_positions = tet_points
         # indices = tet_indices
 
+        def add_attachment(vertex_index, vertex_position):
+            attachment_points_positions.append(vertex_position)
+            idx.append(vertex_index)
+            offset = vertex_position - obj_pos
+            offset = torch.tensor(offset, device="cuda:0").float()
+            offset = math_utils.quat_apply_inverse(obj_orientation[0].reshape((1, 4)), offset.reshape((1, 3)))[0]
+            attachment_offsets.append(offset.cpu().numpy())
+
         for i, v in enumerate(vertex_positions):
             # print("raycast ", i)
             ray_dir = [
@@ -341,24 +408,99 @@ class UipcIsaacAttachments:
             if hitInfo["hit"]:
                 # print("hiiiit, ", hitInfo["collision"])
                 if str(init_prim.GetPath()) in hitInfo["collision"]:  # prevent attaching to unrelated geometry
-                    attachment_points_positions.append(v)
-                    # idx.append(i+min_vertex_idx) unlike the gipc simulation, we use the object specific idx here
-                    idx.append(i)
-                    # TODO do this at the end and compute in a vectorized fashion?
-                    # compute offsets from object position to attachment points
-                    offset = v - obj_pos
-                    offset = torch.tensor(offset, device="cuda:0").float()
-                    offset = math_utils.quat_apply_inverse(obj_orientation[0].reshape((1, 4)), offset.reshape((1, 3)))[
-                        0
-                    ]
-                    offset = offset.cpu().numpy()
-                    attachment_offsets.append(offset)
+                    add_attachment(i, v)
+
+        # Isaac Sim 6 returns no PhysX scene-query contacts while the timeline is stopped.  Preserve the
+        # PhysX result when available, and only then fall back to the authored USD collision meshes.
+        if not idx:
+            collision_meshes = [
+                prim
+                for prim in Usd.PrimRange(init_prim)
+                if prim.IsA(UsdGeom.Mesh) and prim.HasAPI(UsdPhysics.CollisionAPI)
+            ]
+            print(
+                f"PhysX attachment query found zero matches for {isaac_mesh_path}; "
+                f"checking {len(collision_meshes)} authored USD collision meshes."
+            )
+            if diagnostics is not None:
+                diagnostics["attachment_source"] = "usd_collision_fallback"
+
+            def squared_point_triangle_distance(point, a, b, c):
+                ab, ac, ap = b - a, c - a, point - a
+                d1, d2 = np.dot(ab, ap), np.dot(ac, ap)
+                if d1 <= 0.0 and d2 <= 0.0:
+                    return np.dot(ap, ap)
+                bp = point - b
+                d3, d4 = np.dot(ab, bp), np.dot(ac, bp)
+                if d3 >= 0.0 and d4 <= d3:
+                    return np.dot(bp, bp)
+                vc = d1 * d4 - d3 * d2
+                if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+                    projection = a + (d1 / (d1 - d3)) * ab
+                    return np.dot(point - projection, point - projection)
+                cp = point - c
+                d5, d6 = np.dot(ab, cp), np.dot(ac, cp)
+                if d6 >= 0.0 and d5 <= d6:
+                    return np.dot(cp, cp)
+                vb = d5 * d2 - d1 * d6
+                if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+                    projection = a + (d2 / (d2 - d6)) * ac
+                    return np.dot(point - projection, point - projection)
+                va = d3 * d6 - d5 * d4
+                if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+                    projection = b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b)
+                    return np.dot(point - projection, point - projection)
+                normal = np.cross(ab, ac)
+                return np.dot(ap, normal) ** 2 / np.dot(normal, normal)
+
+            max_distance_squared = (sphere_radius + max_dist) ** 2
+            attached_indices = set()
+            for collision_mesh_prim in collision_meshes:
+                collision_mesh = UsdGeom.Mesh(collision_mesh_prim)
+                local_points = np.asarray(collision_mesh.GetPointsAttr().Get(), dtype=np.float64)
+                face_counts = np.asarray(collision_mesh.GetFaceVertexCountsAttr().Get(), dtype=np.int64)
+                face_indices = np.asarray(collision_mesh.GetFaceVertexIndicesAttr().Get(), dtype=np.int64)
+                if local_points.size == 0 or face_counts.size == 0:
+                    continue
+                transform = np.asarray(omni.usd.get_world_transform_matrix(collision_mesh), dtype=np.float64)
+                world_points = (transform.T @ np.vstack((local_points.T, np.ones(len(local_points)))))[:3].T
+                start = 0
+                triangles = []
+                for face_count in face_counts:
+                    face = face_indices[start : start + face_count]
+                    triangles.extend((face[0], face[j], face[j + 1]) for j in range(1, face_count - 1))
+                    start += face_count
+                if diagnostics is not None:
+                    mesh_diagnostics = {
+                        "prim_path": str(collision_mesh_prim.GetPath()),
+                        "point_count": int(len(local_points)),
+                        "face_count": int(len(face_counts)),
+                        "triangle_count": int(len(triangles)),
+                        "world_transform": transform.tolist(),
+                        "attached_vertex_indices": [],
+                    }
+                    diagnostics["collision_meshes"].append(mesh_diagnostics)
+                for vertex_index, vertex_position in enumerate(vertex_positions):
+                    if vertex_index in attached_indices:
+                        continue
+                    if any(
+                        squared_point_triangle_distance(vertex_position, world_points[a], world_points[b], world_points[c])
+                        <= max_distance_squared
+                        for a, b, c in triangles
+                    ):
+                        add_attachment(vertex_index, vertex_position)
+                        attached_indices.add(vertex_index)
+                        if diagnostics is not None:
+                            mesh_diagnostics["attached_vertex_indices"].append(int(vertex_index))
+            print(f"USD collision fallback attached {len(idx)} vertices for {isaac_mesh_path}.")
 
         attachment_points_positions = np.array(attachment_points_positions).reshape(-1, 3)
 
         # offset to later compute the `should-be` positions of the attachment point
         attachment_offsets = np.array(attachment_offsets).reshape(-1, 3)
         assert len(idx) == attachment_offsets.shape[0]
+        if diagnostics is not None:
+            diagnostics["attachment_point_count"] = int(len(idx))
 
         # print("offsets, ", attachment_offsets)
         # print("attachment local idx, ", idx)
@@ -407,8 +549,15 @@ class UipcIsaacAttachments:
         obj_position = np.array([obj_position])
 
         q = pose.ExtractRotation().GetQuaternion()
-        obj_orientation = [q.GetReal(), q.GetImaginary()[0], q.GetImaginary()[1], q.GetImaginary()[2]]
-        obj_orientation = torch.tensor(np.array([obj_orientation]), device="cuda:0").float()
+        obj_orientation_wxyz = [
+            q.GetReal(),
+            q.GetImaginary()[0],
+            q.GetImaginary()[1],
+            q.GetImaginary()[2],
+        ]
+        obj_orientation = math_utils.convert_quat(
+            torch.tensor(np.array([obj_orientation_wxyz]), device="cuda:0").float(), to="xyzw"
+        )
 
         attachment_points_positions = []
         attachment_offsets = []
@@ -462,8 +611,15 @@ class UipcIsaacAttachments:
         obj_position = np.array([obj_position])
 
         q = pose.ExtractRotation().GetQuaternion()
-        obj_orientation = [q.GetReal(), q.GetImaginary()[0], q.GetImaginary()[1], q.GetImaginary()[2]]
-        obj_orientation = torch.tensor(np.array([obj_orientation]), device="cuda:0").float()
+        obj_orientation_wxyz = [
+            q.GetReal(),
+            q.GetImaginary()[0],
+            q.GetImaginary()[1],
+            q.GetImaginary()[2],
+        ]
+        obj_orientation = math_utils.convert_quat(
+            torch.tensor(np.array([obj_orientation_wxyz]), device="cuda:0").float(), to="xyzw"
+        )
 
         attachment_points_positions = []
         attachment_offsets = []
@@ -491,20 +647,28 @@ class UipcIsaacAttachments:
 
     def _initialize_impl(self):
         if self.cfg.body_name is not None:
-            self.rigid_body_id, found_body_name = self.isaaclab_rigid_object.find_bodies(self.cfg.body_name)
+            self.rigid_body_id, self._found_body_names = self.isaaclab_rigid_object.find_bodies(self.cfg.body_name)
 
         self._create_animation()
 
+        from isaaclab_physx.physics import IsaacEvents
+
         sim: sim_utils.SimulationContext = sim_utils.SimulationContext.instance()
-        sim.add_physics_callback(
-            f"{self.uipc_object.cfg.prim_path}_X_{self.isaaclab_rigid_object.cfg.prim_path}_attachment_update",
+        self._aim_position_handle = sim.physics_manager.register_callback(
             self._compute_aim_positions,
+            IsaacEvents.POST_PHYSICS_STEP,
+            name=f"{self.uipc_object.cfg.prim_path}_X_{self.isaaclab_rigid_object.cfg.prim_path}_attachment_update",
         )
 
     def _create_animation(self):
         animator = self.uipc_object._uipc_sim.scene.animator()
 
         def animate_tet(info: Animation.UpdateInfo):  # animation function
+            self._animation_callback_count += 1
+            self._last_animation_aim_generation = self._aim_callback_count
+            uipc_sim = self.uipc_object._uipc_sim
+            self._last_animation_uipc_step_serial = int(getattr(uipc_sim, "_post_physics_step_serial", -1))
+            self._last_animation_uipc_step_phase = str(getattr(uipc_sim, "_post_physics_step_phase", "unknown"))
             # print("test, ", self.aim_positions)
             if len(self.aim_positions) == 0:
                 return
@@ -529,19 +693,31 @@ class UipcIsaacAttachments:
     def _compute_aim_positions(self, dt=0):
         # make sure we have the newest data
 
-        if type(self.isaaclab_rigid_object) is Articulation:
+        physics_view = getattr(self.isaaclab_rigid_object, "root_physx_view", None)
+        if physics_view is None:
+            physics_view = self.isaaclab_rigid_object._root_physx_view
+        if hasattr(physics_view, "get_link_transforms"):
             # this only works when rigid body is an articulation
             # self.isaaclab_rigid_object._physics_sim_view.update_articulations_kinematic()
-            # read data from simulation
-            poses = self.isaaclab_rigid_object._root_physx_view.get_link_transforms().clone()
-            poses[..., 3:7] = math_utils.convert_quat(poses[..., 3:7], to="wxyz")
+            # ``get_link_transforms`` and Isaac Lab's ``transform_points`` both
+            # use PhysX ``(x, y, z, w)`` quaternions in the pinned runtime.
+            # Keep that convention here: reordering to ``(w, x, y, z)`` before
+            # ``transform_points`` rotates the UIPC target frame incorrectly
+            # while still leaving the gel close to its (wrong) targets.
+            poses = physics_view.get_link_transforms()
+            poses = poses.torch if hasattr(poses, "torch") else poses
+            poses = torch.as_tensor(poses, device="cuda") if not isinstance(poses, torch.Tensor) else poses
+            poses = poses.clone()
             pose = poses[:, self.rigid_body_id, 0:7].clone()
-        elif type(self.isaaclab_rigid_object) is RigidObject:
+        elif hasattr(physics_view, "root_state_w"):
             # only works with rigid body
-            pose = self.isaaclab_rigid_object._root_physx_view.root_state_w.view(-1, 1, 13)
+            pose = physics_view.root_state_w
+            pose = pose.torch if hasattr(pose, "torch") else pose
+            pose = torch.as_tensor(pose, device="cuda") if not isinstance(pose, torch.Tensor) else pose
+            pose = pose.view(-1, 1, 13)
             pose = pose[:, self.rigid_body_id, 0:7].clone()
         else:
-            raise RuntimeError("Need an Articulation or a RigidBody object for the Isaac X UIPC attachment.")
+            raise RuntimeError(f"Unsupported Isaac attachment physics view: {type(physics_view)!r}")
         # - doing this is undesirable -> need to update the scene to get newest data
         # pose = self.isaaclab_rigid_object.data.body_state_w[:, self.rigid_body_id, 0:7].clone()
 
@@ -561,6 +737,39 @@ class UipcIsaacAttachments:
         )  # todo give over batch of pos and quat for each instance (i.e. pos has shape N,3 and quat N,4)
         aim_pos = aim_pos.cpu().numpy()
         self.aim_positions = aim_pos.flatten().reshape(-1, 3)
+        self._aim_callback_count += 1
+        self._last_aim_callback_dt = float(dt)
+        uipc_sim = self.uipc_object._uipc_sim
+        self._last_aim_uipc_step_serial = int(getattr(uipc_sim, "_post_physics_step_serial", -1))
+        self._last_aim_uipc_step_phase = str(getattr(uipc_sim, "_post_physics_step_phase", "unknown"))
+
+    def get_diagnostics(self) -> dict:
+        """Return JSON-safe attachment metadata and callback ordering counters."""
+        diagnostics = dict(self.diagnostic_data)
+        rigid_body_ids = [] if self.rigid_body_id is None else np.asarray(self.rigid_body_id).reshape(-1).tolist()
+        diagnostics.update(
+            {
+                "rigid_body_ids": [int(body_id) for body_id in rigid_body_ids],
+                "found_body_names": [str(name) for name in self._found_body_names],
+                "aim_callback_count": int(self._aim_callback_count),
+                "animation_callback_count": int(self._animation_callback_count),
+                "last_animation_aim_generation": int(self._last_animation_aim_generation),
+                "aim_pose_quaternion_convention": "xyzw",
+                "aim_generation_minus_last_animation": int(
+                    self._aim_callback_count - self._last_animation_aim_generation
+                ),
+                "last_aim_callback_dt_s": self._last_aim_callback_dt,
+                "last_aim_uipc_step_serial": int(self._last_aim_uipc_step_serial),
+                "last_aim_uipc_step_phase": self._last_aim_uipc_step_phase,
+                "last_animation_uipc_step_serial": int(self._last_animation_uipc_step_serial),
+                "last_animation_uipc_step_phase": self._last_animation_uipc_step_phase,
+                "uipc_step_serial_minus_last_aim": int(
+                    getattr(self.uipc_object._uipc_sim, "_post_physics_step_serial", -1)
+                    - self._last_aim_uipc_step_serial
+                ),
+            }
+        )
+        return diagnostics
 
         #      # extract velocity
         #      lin_vel = scene["robot"].data.body_state_w[:, robot_entity_cfg.body_ids[1], 7:10]

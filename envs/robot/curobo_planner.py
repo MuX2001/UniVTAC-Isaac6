@@ -2,8 +2,9 @@ from curobo.geom.transform import pose_multiply
 import numpy as np
 import transforms3d as t3d
 from curobo.types.robot import JointState
-from curobo.util.usd_helper import UsdHelper
+from curobo.util.usd_helper import UsdHelper, WorldConfig
 from curobo.types.math import Pose as CuroboPose
+from curobo.geom.types import Mesh
 from curobo.geom.sdf.world import CollisionCheckerType
 from curobo.wrap.reacher.motion_gen import (
     MotionGen,
@@ -76,32 +77,157 @@ class CuroboPlanner:
             rotation_threshold=0.01,
             high_precision=True,
             collision_checker_type=CollisionCheckerType.MESH,
-            collision_activation_distance=0.4
+            # Match the upstream UniVTAC planning configuration.  A 0.4 m
+            # activation shell is far larger than this robot/object scene and
+            # changed the generated trajectory even when no collision occurred.
+            collision_activation_distance=0.0,
         )
         self.motion_gen = MotionGen(motion_gen_config)
         self.motion_gen.warmup()
+        # Populated for every query so callers can record why a failed plan was
+        # rejected.  This is telemetry only; it does not alter a MotionGen
+        # configuration or retry policy.
+        self.last_plan_diagnostics = None
+        self.last_world_diagnostics = None
     
     def reset(self):
         self.motion_gen.reset()
 
     def get_curr_world_cfg(self):
-        # obstacles = self.usd_helper.get_obstacles_from_stage(
-        #     only_paths=["/World"],
-        #     reference_prim_path=self.robot_prime_path,
-        #     ignore_substring=['/World/defaultGroundPlane', '/World/visualize/*', self.robot_prime_path]
-        # ).get_collision_check_world()
-        obstacles = {
-            "cuboid": {
-                "table": {
-                    "dims": [0.5, 0, 0],
-                    "pose": [-1000, 0.0, 0.0, 1, 0, 0, 0],
-                },
-            }
-        }
+        """Build the collision world used by CuRobo from current scene state.
+
+        The original UniVTAC planner includes the ground plate and actor meshes.
+        The Isaac Sim 6 port temporarily replaced that world with a cuboid at
+        x=-1000, which silently disabled environment collision checks and made
+        its trajectories incomparable to the official dataset.  Retain actor
+        meshes even if Isaac Sim 6 cannot convert the authored ground plate.
+        """
+        diagnostics = {"ground_plate": "unavailable", "actor_meshes": [], "errors": []}
+        try:
+            obstacles = self.usd_helper.get_obstacles_from_stage(
+                only_paths=["/World/envs/env_0/ground_plate"],
+                reference_prim_path=self.robot_prime_path,
+            ).get_collision_check_world()
+            diagnostics["ground_plate"] = "stage_mesh"
+        except Exception as exc:
+            obstacles = WorldConfig()
+            diagnostics["errors"].append(f"ground_plate: {type(exc).__name__}: {exc}")
+
+        for name, actor in self.task._actor_manager.actors.items():
+            try:
+                vertices = np.asarray(actor.vertices)
+                if vertices.size == 0:
+                    raise ValueError("actor has no surface vertices")
+                mesh = Mesh.from_pointcloud(vertices.reshape(-1, 3), pitch=0.005, name=name)
+                obstacles.add_obstacle(mesh)
+                diagnostics["actor_meshes"].append(name)
+            except Exception as exc:
+                diagnostics["errors"].append(f"actor {name}: {type(exc).__name__}: {exc}")
+        self.last_world_diagnostics = diagnostics
         return obstacles
  
     def update_world(self):
         self.motion_gen.update_world(self.get_curr_world_cfg())
+
+    @staticmethod
+    def _diagnostic_value(value):
+        """Convert a CuRobo value into a bounded JSON-safe diagnostic value."""
+        if value is None or isinstance(value, (bool, int, str)):
+            return value
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float):
+            return value if np.isfinite(value) else repr(value)
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        if isinstance(value, np.ndarray):
+            if value.size <= 32:
+                return CuroboPlanner._diagnostic_value(value.tolist())
+            finite = np.isfinite(value)
+            finite_values = value[finite]
+            return {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "finite_count": int(finite.sum()),
+                "min": None if not finite_values.size else float(finite_values.min()),
+                "max": None if not finite_values.size else float(finite_values.max()),
+            }
+        if isinstance(value, (list, tuple)):
+            if len(value) > 32:
+                return {"length": len(value), "preview": [CuroboPlanner._diagnostic_value(v) for v in value[:8]]}
+            return [CuroboPlanner._diagnostic_value(v) for v in value]
+        if isinstance(value, dict):
+            return {
+                str(key): CuroboPlanner._diagnostic_value(item)
+                for key, item in list(value.items())[:32]
+            }
+        value_repr = repr(value)
+        return value_repr[:1000] + ("..." if len(value_repr) > 1000 else "")
+
+    def _record_plan_diagnostics(self, result, target_pose, joint_pos, joint_vel, plan_config):
+        """Store fields exposed by MotionGenResult without interpreting success."""
+        diagnostics = {
+            "target_pose_robot_base_xyz_wxyz": self._diagnostic_value(target_pose.tolist()),
+            "start_joint_position": self._diagnostic_value(joint_pos),
+            "start_joint_velocity": self._diagnostic_value(joint_vel),
+            "collision_world": self._diagnostic_value(self.last_world_diagnostics),
+            "plan_config": {
+                "max_attempts": int(plan_config.max_attempts),
+                "time_dilation_factor": self._diagnostic_value(plan_config.time_dilation_factor),
+                "has_pose_cost_metric": bool(plan_config.pose_cost_metric is not None),
+            },
+        }
+        for field in (
+            "success",
+            "valid_query",
+            "status",
+            "attempts",
+            "trajopt_attempts",
+            "used_graph",
+            "solve_time",
+            "ik_time",
+            "graph_time",
+            "trajopt_time",
+            "finetune_time",
+            "total_time",
+            "position_error",
+            "rotation_error",
+            "cspace_error",
+            "optimized_dt",
+        ):
+            if hasattr(result, field):
+                diagnostics[field] = self._diagnostic_value(getattr(result, field))
+        for field in ("interpolated_plan", "optimized_plan", "path_buffer_last_tstep"):
+            if hasattr(result, field):
+                value = getattr(result, field)
+                diagnostics[f"has_{field}"] = value is not None
+        # CuRobo versions can expose a very different number of execution
+        # waypoints in the optimized and interpolated trajectories.  Record
+        # both read-only summaries so a compatibility diagnosis does not infer
+        # the executed cadence from one representation alone.
+        for plan_name in ("interpolated", "optimized"):
+            plan = getattr(result, f"{plan_name}_plan", None)
+            if plan is None:
+                continue
+            position = getattr(plan, "position", None)
+            velocity = getattr(plan, "velocity", None)
+            if position is not None:
+                diagnostics[f"{plan_name}_plan_num_steps"] = int(position.shape[0])
+                if position.shape[0] > 1:
+                    diagnostics[f"{plan_name}_plan_max_position_step_delta"] = self._diagnostic_value(
+                        torch.abs(position[1:] - position[:-1]).amax(dim=0)
+                    )
+            if velocity is not None:
+                diagnostics[f"{plan_name}_plan_max_abs_velocity"] = self._diagnostic_value(
+                    torch.abs(velocity).amax(dim=0)
+                )
+        if hasattr(result, "interpolation_dt"):
+            diagnostics["interpolation_dt"] = self._diagnostic_value(result.interpolation_dt)
+        if hasattr(result, "debug_info"):
+            debug_info = result.debug_info
+            diagnostics["debug_info_type"] = type(debug_info).__name__
+            diagnostics["debug_info"] = self._diagnostic_value(debug_info)
+        self.last_plan_diagnostics = diagnostics
 
     def plan_path(
         self,
@@ -113,7 +239,7 @@ class CuroboPlanner:
         constraint_pose=None,
         time_dilation_factor=None
     ):
-        # self.update_world()
+        self.update_world()
         target_pose = calculate_target_pose(
             real_robot_pose, self.robot_origin_pose, target_ee_pose)
         # transformation from world to arm's base
@@ -158,5 +284,6 @@ class CuroboPlanner:
         if pose_cost_metric is not None:
             plan_config.pose_cost_metric = pose_cost_metric
 
-        return self.motion_gen.plan_single(
-            start_joint_states, goal_pose_of_ee, plan_config)
+        result = self.motion_gen.plan_single(start_joint_states, goal_pose_of_ee, plan_config)
+        self._record_plan_diagnostics(result, target_pose, joint_pos, joint_vel, plan_config)
+        return result

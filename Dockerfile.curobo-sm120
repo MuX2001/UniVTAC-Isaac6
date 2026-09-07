@@ -1,0 +1,7 @@
+ARG BASE_IMAGE=user10/univtac-isaac60-lab3-tacex:ftp1-pytorch-runtime-fem-tactile
+FROM ${BASE_IMAGE}
+
+# Rebuild the cuRobo CUDA extensions for this workstation's Blackwell GPU.  This does not
+# change Isaac Sim, CUDA, PyTorch, or any Python package version.
+WORKDIR /opt/curobo
+RUN TORCH_CUDA_ARCH_LIST=12.0 /isaac-sim/python.sh setup.py build_ext --inplace

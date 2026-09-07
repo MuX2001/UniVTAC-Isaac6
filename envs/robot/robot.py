@@ -22,6 +22,12 @@ if TYPE_CHECKING:
     from curobo.wrap.reacher.motion_gen import MotionGenResult
     from .._base_task import BaseTask
 
+
+def _as_torch(value):
+    """Convert Isaac Lab Fabric proxy arrays only at Torch math boundaries."""
+    return value.torch if hasattr(value, "torch") else value
+
+
 class RobotManager:
     def __init__(self, robot_cfg:RobotCfg, task:'BaseTask', planner_time_dilation_factor:float=1.0):
         self.cfg = robot_cfg
@@ -71,14 +77,14 @@ class RobotManager:
 
         self._arm_ids = torch.tensor([
             self.joint_name_to_id[n] for n in self._arm_joint_names
-        ], device=self.device)
+        ], device=self.device, dtype=torch.int32)
         self._gripper_ids = torch.tensor([
             self.joint_name_to_id[n] for n in self._gripper_joint_names
-        ], device=self.device)
+        ], device=self.device, dtype=torch.int32)
         self.origin_pose = self.get_gripper_center_pose()
         self._all_ids = torch.cat([self._arm_ids, self._gripper_ids], dim=0)
  
-        self.root_pose = Pose.from_list(self.robot.data.root_link_pos_w[0])
+        self.root_pose = Pose.from_list(_as_torch(self.robot.data.root_link_pos_w)[0])
         planner_cfg = CuroboPlannerCfg(
             dt=self.task.cfg.sim.dt,
             all_joints_name=self.robot.joint_names,
@@ -111,13 +117,19 @@ class RobotManager:
         """获取当前末端执行器目标位姿（target_pose）"""
         if env_ids is None:
             env_ids = [0]
-        ee_pos_w = self.robot.data.body_link_pos_w[:, self._body_idx]
-        ee_quat_w = self.robot.data.body_link_quat_w[:, self._body_idx]
-        root_pos_w = self.robot.data.root_link_pos_w
-        root_quat_w = self.robot.data.root_link_quat_w
+        ee_pos_w = _as_torch(self.robot.data.body_link_pos_w)[:, self._body_idx]
+        ee_quat_w = _as_torch(self.robot.data.body_link_quat_w)[:, self._body_idx]
+        root_pos_w = _as_torch(self.robot.data.root_link_pos_w)
+        root_quat_w = _as_torch(self.robot.data.root_link_quat_w)
         ee_pose_b, ee_quat_b = math_utils.subtract_frame_transforms(
             root_pos_w, root_quat_w, ee_pos_w, ee_quat_w)
-        return Pose(ee_pose_b[0].cpu().numpy(), ee_quat_b[0].cpu().numpy())
+        # Isaac Lab 3 articulation data and ``subtract_frame_transforms`` use
+        # xyzw quaternions, while task ``Pose`` and cuRobo use wxyz.  Leaving
+        # the result in Lab order made every pose-derived planner goal request
+        # a different wrist orientation.  This is an interface conversion
+        # only; it does not modify physics, collision, commands, or limits.
+        ee_quat_b_wxyz = ee_quat_b[:, [3, 0, 1, 2]]
+        return Pose(ee_pose_b[0].cpu().numpy(), ee_quat_b_wxyz[0].cpu().numpy())
 
     def get_qpos(self):
         return self.robot.data.joint_pos.clone().cpu()
@@ -129,25 +141,30 @@ class RobotManager:
 
     def set_arm(self, pos:torch.Tensor, vel:torch.Tensor=None, env_ids:slice=None, force:bool=True):
         '''设置目标位姿'''
+        # Isaac Lab 3 expects targets to include the environment dimension.
+        # The task controller produces one 1-D joint command for its enforced
+        # single-environment workflow, so add that dimension at this boundary.
+        if pos.ndim == 1:
+            pos = pos.unsqueeze(0)
+        if vel is not None and vel.ndim == 1:
+            vel = vel.unsqueeze(0)
         self.robot.set_joint_position_target(pos, joint_ids=self._arm_ids, env_ids=env_ids)
         if vel is not None:
             self.robot.set_joint_velocity_target(vel, joint_ids=self._arm_ids, env_ids=env_ids)
-        if force:
-            self.robot.root_physx_view.set_dof_positions(
-                self.robot._data.joint_pos_target,
-                self.robot._ALL_INDICES
-            )
+        # ``write_joint_state_to_sim`` is reset-only.  Normal task motion emits
+        # controller targets through ``scene.write_data_to_sim()``.
 
     def set_gripper(self, pos:torch.Tensor, vel:torch.Tensor=None, env_ids:slice=None, force:bool=True):
         '''设置目标位姿'''
+        # See set_arm: Lab 3 validates targets as (num_envs, num_joints).
+        if pos.ndim == 1:
+            pos = pos.unsqueeze(0)
+        if vel is not None and vel.ndim == 1:
+            vel = vel.unsqueeze(0)
         self.robot.set_joint_position_target(pos, joint_ids=self._gripper_ids, env_ids=env_ids)
         if vel is not None:
             self.robot.set_joint_velocity_target(vel, joint_ids=self._gripper_ids, env_ids=env_ids)
-        if force:
-            self.robot.root_physx_view.set_dof_positions(
-                self.robot._data.joint_pos_target,
-                self.robot._ALL_INDICES
-            )
+        # See ``set_arm`` for the controller target path.
 
     def plan_arm(self, target_pose:Pose, constraint_pose=None, pre_dis=None, time_dilation_factor=None):
         result:MotionGenResult = self.planner.plan_path(
@@ -159,16 +176,24 @@ class RobotManager:
             constraint_pose=constraint_pose,
             time_dilation_factor=time_dilation_factor
         )
+        diagnostics = self.planner.last_plan_diagnostics
         
         if result.success.item():
             return {
                 'status': 'Success',
                 'num_steps': result.interpolated_plan.position.shape[0],
                 'position': result.interpolated_plan.position.detach(),
-                'velocity': result.interpolated_plan.velocity.detach()
+                'velocity': result.interpolated_plan.velocity.detach(),
+                'diagnostics': diagnostics,
             }
         else:
-            return {'status': 'Fail', 'num_steps': 0, 'position': None, 'velocity': None}
+            return {
+                'status': 'Fail',
+                'num_steps': 0,
+                'position': None,
+                'velocity': None,
+                'diagnostics': diagnostics,
+            }
 
     def gripper_percent2qpos(self, percentage:float):
         gripper_range = [0, self.gripper_max_qpos]

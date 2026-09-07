@@ -30,6 +30,7 @@ INSTALL_REQUIRES = [
     # ),
     "psutil",
     "nvidia-ml-py",
+    "scikit-learn",
     "pre-commit",
 ]
 

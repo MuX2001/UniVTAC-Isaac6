@@ -10,11 +10,11 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import omni.log
-import omni.physics.tensors.impl.api as physx
+import omni.physics.tensors as physx
 import omni.usd
 import usdrt
 import usdrt.UsdGeom
-from isaacsim.core.prims import XFormPrim
+from isaaclab.sim.views import FrameView
 from pxr import UsdGeom
 
 try:
@@ -55,6 +55,9 @@ if TYPE_CHECKING:
 class UipcObjectCfg(AssetBaseCfg):
     mesh_cfg: TetMeshCfg = None
     # contact_model:
+
+    use_initial_state_transform: bool = False
+    """Seed tetrahedral points from the configured asset pose instead of the composed USD mesh transform."""
 
     mass_density: float = 1e3
 
@@ -127,8 +130,7 @@ class UipcObject(AssetBase):
 
         prim_paths_expr = self.cfg.prim_path  # + "/mesh"
         omni.log.info(f"Initializing uipc objects {prim_paths_expr}...")
-        self._prim_view = XFormPrim(prim_paths_expr=prim_paths_expr, name=f"{prim_paths_expr}", usd=False)
-        self._prim_view.initialize()
+        self._prim_view = FrameView(prim_paths_expr, device="cpu")
 
         self.stage = usdrt.Usd.Stage.Attach(omni.usd.get_context().get_stage_id())
 
@@ -177,7 +179,20 @@ class UipcObject(AssetBase):
                 replace_color = True
 
             # transform local tet points to world coor
-            tf_world = omni.usd.get_world_transform_matrix(usd_mesh)
+            if self.cfg.use_initial_state_transform:
+                w, x, y, z = self.cfg.init_state.rot
+                standard_transform = np.eye(4)
+                standard_transform[:3, :3] = np.array(
+                    [
+                        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+                    ]
+                )
+                standard_transform[:3, 3] = self.cfg.init_state.pos
+                tf_world = standard_transform.T
+            else:
+                tf_world = omni.usd.get_world_transform_matrix(usd_mesh)
 
             tet_points_world = np.array(tf_world).T @ np.vstack((tet_points.T, np.ones(tet_points.shape[0])))
             tet_points_world = tet_points_world[:-1].T

@@ -9,8 +9,7 @@ from typing import Any
 
 import carb
 import omni.usd
-from isaacsim.core.cloner import GridCloner
-from isaacsim.core.prims import XFormPrim
+from isaaclab.sim.views import FrameView
 from pxr import PhysxSchema
 
 import isaaclab.sim as sim_utils
@@ -124,16 +123,28 @@ class UipcInteractiveScene:
         self.stage = omni.usd.get_context().get_stage()
         # physics scene path
         self._physics_scene_path = None
-        # prepare cloner for environment replication
-        self.cloner = GridCloner(spacing=self.cfg.env_spacing)
-        self.cloner.define_base_env(self.env_ns)
-        self.env_prim_paths = self.cloner.generate_paths(f"{self.env_ns}/env", self.cfg.num_envs)
+        # A single environment already is the source prim: invoking Isaac
+        # Sim's legacy GridCloner for ``env_0 -> env_0`` is unnecessary and
+        # incompatible with Isaac Lab 3's PhysX manager in a headless app.
+        # Keep the legacy cloner exclusively for genuine multi-environment
+        # replication.
+        self.cloner = None
+        if self.cfg.num_envs == 1:
+            self.env_prim_paths = [f"{self.env_ns}/env_0"]
+            self._default_env_origins = torch.zeros((1, 3), device=self.device, dtype=torch.float32)
+        else:
+            from isaacsim.core.cloner import GridCloner
+
+            self.cloner = GridCloner(spacing=self.cfg.env_spacing)
+            self.cloner.define_base_env(self.env_ns)
+            self.env_prim_paths = self.cloner.generate_paths(f"{self.env_ns}/env", self.cfg.num_envs)
+            self._default_env_origins = None
         # create source prim
         self.stage.DefinePrim(self.env_prim_paths[0], "Xform")
 
         # when replicate_physics=False, we assume heterogeneous environments and clone the xforms first.
         # this triggers per-object level cloning in the spawner.
-        if not self.cfg.replicate_physics:
+        if not self.cfg.replicate_physics and self.cloner is not None:
             # clone the env xform
             env_origins = self.cloner.clone(
                 source_prim_path=self.env_prim_paths[0],
@@ -143,7 +154,7 @@ class UipcInteractiveScene:
                 enable_env_ids=self.cfg.filter_collisions,  # this won't do anything because we are not replicating physics
             )
             self._default_env_origins = torch.tensor(env_origins, device=self.device, dtype=torch.float32)
-        else:
+        elif self.cloner is not None:
             # otherwise, environment origins will be initialized during cloning at the end of environment creation
             self._default_env_origins = None
 
@@ -178,6 +189,10 @@ class UipcInteractiveScene:
             If True, clones are independent copies of the source prim and won't reflect its changes (start-up time
             may increase). Defaults to False.
         """
+        # Nothing needs cloning for the already-authored source environment.
+        if self.cloner is None:
+            return
+
         # check if user spawned different assets in individual environments
         # this flag will be None if no multi asset is spawned
         carb_settings_iface = carb.settings.get_settings()
@@ -220,6 +235,10 @@ class UipcInteractiveScene:
             global_prim_paths: A list of global prim paths to enable collisions with.
                 Defaults to None, in which case no global prim paths are considered.
         """
+        # A single environment has no inter-environment collisions to filter.
+        if self.cloner is None:
+            return
+
         # validate paths in global prim paths
         if global_prim_paths is None:
             global_prim_paths = []
@@ -339,7 +358,7 @@ class UipcInteractiveScene:
         return self._sensors
 
     @property
-    def extras(self) -> dict[str, XFormPrim]:
+    def extras(self) -> dict[str, FrameView]:
         """A dictionary of miscellaneous simulation objects that neither inherit from assets nor sensors.
 
         The keys are the names of the miscellaneous objects, and the values are the `XFormPrim`_
@@ -647,7 +666,7 @@ class UipcInteractiveScene:
                     )
                 # store xform prim view corresponding to this asset
                 # all prims in the scene are Xform prims (i.e. have a transform component)
-                self._extras[asset_name] = XFormPrim(asset_cfg.prim_path, reset_xform_properties=False)
+                self._extras[asset_name] = FrameView(asset_cfg.prim_path, device=self.device, stage=self.stage)
             elif isinstance(asset_cfg, UipcObjectCfg):
                 self._uipc_objects[asset_name] = asset_cfg.class_type(asset_cfg)
             else:
